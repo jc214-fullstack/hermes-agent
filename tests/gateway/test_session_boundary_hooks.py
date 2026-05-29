@@ -101,6 +101,33 @@ async def test_reset_fires_reset_hook(mock_invoke_hook):
 
 @pytest.mark.asyncio
 @patch("hermes_cli.plugins.invoke_hook")
+async def test_reset_persists_fresh_session_route_metadata(mock_invoke_hook, monkeypatch):
+    """/new should immediately stamp the fresh session row with its routed model."""
+    runner = _make_runner()
+    runner._session_db = MagicMock()
+    runner._resolve_session_agent_runtime = MagicMock(
+        return_value=(
+            "gpt-5.3-codex",
+            {
+                "provider": "openai-codex",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+            },
+        )
+    )
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+
+    await runner._handle_reset_command(_make_event("/new"))
+
+    runner._session_db.update_session_route_metadata.assert_called_once_with(
+        "sess-new",
+        model="gpt-5.3-codex",
+        billing_provider="openai-codex",
+        billing_base_url="https://chatgpt.com/backend-api/codex",
+    )
+
+
+@pytest.mark.asyncio
+@patch("hermes_cli.plugins.invoke_hook")
 async def test_finalize_before_reset(mock_invoke_hook):
     """on_session_finalize must fire before on_session_reset."""
     runner = _make_runner()

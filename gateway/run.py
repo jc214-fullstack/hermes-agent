@@ -8804,7 +8804,7 @@ class GatewayRunner:
                             f"Adjust reset timing in config.yaml under session_reset."
                         )
                         try:
-                            session_info = self._format_session_info()
+                            session_info = self._format_session_info(source=source, session_key=session_key)
                             if session_info:
                                 notice = f"{notice}\n\n{session_info}"
                         except Exception:
@@ -9714,7 +9714,7 @@ class GatewayRunner:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, source: SessionSource | None = None, session_key: str | None = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
@@ -9723,7 +9723,6 @@ class GatewayRunner:
         """
         from agent.model_metadata import get_model_context_length, DEFAULT_FALLBACK_CONTEXT
 
-        model = _resolve_gateway_model()
         config_context_length = None
         provider = None
         base_url = None
@@ -9751,6 +9750,22 @@ class GatewayRunner:
                     custom_provs = data.get("custom_providers")
         except Exception:
             pass
+
+        # Use channel/session-resolved runtime when source is known (e.g. /new in a thread).
+        model = _resolve_gateway_model(data)
+        if source is not None:
+            try:
+                resolved_model, resolved_runtime = self._resolve_session_agent_runtime(
+                    source=source,
+                    session_key=session_key or self._session_key_for_source(source),
+                    user_config=data or {},
+                )
+                model = resolved_model or model
+                if isinstance(resolved_runtime, dict):
+                    provider = resolved_runtime.get("provider") or provider
+                    base_url = resolved_runtime.get("base_url") or base_url
+            except Exception:
+                pass
 
         # Also check custom_providers for context_length when top-level model.context_length is not set
         if config_context_length is None and data:
@@ -9916,7 +9931,7 @@ class GatewayRunner:
 
         # Resolve session config info to surface to the user
         try:
-            session_info = self._format_session_info()
+            session_info = self._format_session_info(source=source, session_key=session_key)
         except Exception:
             session_info = ""
 
@@ -9960,6 +9975,28 @@ class GatewayRunner:
                 self._record_telegram_topic_binding(source, new_entry)
             except Exception:
                 logger.debug("Failed to rebind Telegram topic after /new", exc_info=True)
+
+        # Backfill the fresh session row with the route it will use on the
+        # next turn. Without this, `/new` creates a valid new session ID but
+        # the SQLite session row stays model-less until the first non-command
+        # user message completes, which makes channel-routed resets look like
+        # they did not actually switch models yet.
+        if new_entry is not None and self._session_db is not None:
+            try:
+                user_config = _load_gateway_config()
+                route_model, route_runtime = self._resolve_session_agent_runtime(
+                    source=source,
+                    session_key=new_entry.session_key,
+                    user_config=user_config,
+                )
+                self._session_db.update_session_route_metadata(
+                    new_entry.session_id,
+                    model=route_model or None,
+                    billing_provider=route_runtime.get("provider") or None,
+                    billing_base_url=route_runtime.get("base_url") or None,
+                )
+            except Exception:
+                logger.debug("Failed to persist route metadata for fresh /new session", exc_info=True)
 
         # Fire plugin on_session_reset hook (new session guaranteed to exist)
         try:
@@ -10782,8 +10819,40 @@ class GatewayRunner:
 
         raw_args = event.get_command_args().strip()
 
+        # Parse gateway-only channel binding flags first, then pass the rest to
+        # the shared model-switch parser.
+        import shlex
+        channel_bind = False
+        channel_bind_target: Optional[str] = None
+        filtered_tokens: list[str] = []
+        try:
+            raw_tokens = shlex.split(raw_args)
+        except Exception:
+            raw_tokens = raw_args.split()
+
+        i = 0
+        while i < len(raw_tokens):
+            tok = raw_tokens[i]
+            if tok == "--channel":
+                channel_bind = True
+                if i + 1 < len(raw_tokens) and not raw_tokens[i + 1].startswith("--"):
+                    channel_bind_target = raw_tokens[i + 1].strip()
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if tok.startswith("--channel="):
+                channel_bind = True
+                channel_bind_target = tok.split("=", 1)[1].strip() or None
+                i += 1
+                continue
+            filtered_tokens.append(tok)
+            i += 1
+
+        filtered_args = " ".join(filtered_tokens).strip()
+
         # Parse --provider, --global, and --refresh flags
-        model_input, explicit_provider, persist_global, force_refresh = parse_model_flags(raw_args)
+        model_input, explicit_provider, persist_global, force_refresh = parse_model_flags(filtered_args)
 
         # --refresh: bust the disk cache so the picker shows live data.
         if force_refresh:
@@ -11087,33 +11156,106 @@ class GatewayRunner:
         # override rather than relying on cache signature mismatch detection.
         self._evict_cached_agent(session_key)
 
-        # Persist to config if --global
-        if persist_global:
+        # Persist to config if --global and/or --channel.
+        persisted_channel_id: Optional[str] = None
+        if persist_global or channel_bind:
             try:
                 if config_path.exists():
                     with open(config_path, encoding="utf-8") as f:
                         cfg = yaml.safe_load(f) or {}
                 else:
                     cfg = {}
-                # Coerce scalar/None ``model:`` into a dict before mutation —
-                # otherwise ``cfg.setdefault("model", {})`` returns the existing
-                # scalar and the next assignment raises
-                # ``TypeError: 'str' object does not support item assignment``.
-                # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
-                # string) instead of the proper nested ``model: {default: ...}``.
-                raw_model = cfg.get("model")
-                if isinstance(raw_model, dict):
-                    model_cfg = raw_model
-                elif isinstance(raw_model, str) and raw_model.strip():
-                    model_cfg = {"default": raw_model.strip()}
-                    cfg["model"] = model_cfg
-                else:
-                    model_cfg = {}
-                    cfg["model"] = model_cfg
-                model_cfg["default"] = result.new_model
-                model_cfg["provider"] = result.target_provider
-                if result.base_url:
-                    model_cfg["base_url"] = result.base_url
+
+                if persist_global:
+                    # Coerce scalar/None ``model:`` into a dict before mutation —
+                    # otherwise ``cfg.setdefault("model", {})`` returns the existing
+                    # scalar and the next assignment raises
+                    # ``TypeError: 'str' object does not support item assignment``.
+                    # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
+                    # string) instead of the proper nested ``model: {default: ...}``.
+                    raw_model = cfg.get("model")
+                    if isinstance(raw_model, dict):
+                        model_cfg = raw_model
+                    elif isinstance(raw_model, str) and raw_model.strip():
+                        model_cfg = {"default": raw_model.strip()}
+                        cfg["model"] = model_cfg
+                    else:
+                        model_cfg = {}
+                        cfg["model"] = model_cfg
+                    model_cfg["default"] = result.new_model
+                    model_cfg["provider"] = result.target_provider
+                    if result.base_url:
+                        model_cfg["base_url"] = result.base_url
+
+                if channel_bind:
+                    platform_key = (
+                        source.platform.value
+                        if hasattr(source.platform, "value")
+                        else str(source.platform)
+                    )
+                    raw_platform_cfg = cfg.get(platform_key)
+                    if not isinstance(raw_platform_cfg, dict):
+                        raw_platform_cfg = {}
+                        cfg[platform_key] = raw_platform_cfg
+
+                    raw_bindings = raw_platform_cfg.get("channel_model_bindings")
+                    bindings = raw_bindings if isinstance(raw_bindings, list) else []
+                    raw_platform_cfg["channel_model_bindings"] = bindings
+
+                    target_id = (
+                        (channel_bind_target or "").strip()
+                        or str(getattr(source, "parent_chat_id", "") or "").strip()
+                        or str(getattr(source, "chat_id", "") or "").strip()
+                    )
+                    if target_id:
+                        persisted_channel_id = target_id
+                        entry = {
+                            "id": target_id,
+                            "model": result.new_model,
+                            "provider": result.target_provider,
+                        }
+                        if result.base_url:
+                            entry["base_url"] = result.base_url
+                        if result.api_mode:
+                            entry["api_mode"] = result.api_mode
+
+                        updated = False
+                        for idx, existing in enumerate(bindings):
+                            if isinstance(existing, dict) and str(existing.get("id", "")) == target_id:
+                                merged = dict(existing)
+                                merged.update(entry)
+                                bindings[idx] = merged
+                                updated = True
+                                break
+                        if not updated:
+                            bindings.append(entry)
+
+                        # Apply immediately in-memory so /new after this command
+                        # picks up the channel route without requiring /restart.
+                        try:
+                            platform_cfg_obj = self.config.platforms.get(source.platform)
+                            if platform_cfg_obj is not None:
+                                extra = getattr(platform_cfg_obj, "extra", None)
+                                if not isinstance(extra, dict):
+                                    extra = {}
+                                    platform_cfg_obj.extra = extra
+                                mem_bindings = extra.get("channel_model_bindings")
+                                if not isinstance(mem_bindings, list):
+                                    mem_bindings = []
+                                    extra["channel_model_bindings"] = mem_bindings
+                                mem_updated = False
+                                for idx, existing in enumerate(mem_bindings):
+                                    if isinstance(existing, dict) and str(existing.get("id", "")) == target_id:
+                                        merged = dict(existing)
+                                        merged.update(entry)
+                                        mem_bindings[idx] = merged
+                                        mem_updated = True
+                                        break
+                                if not mem_updated:
+                                    mem_bindings.append(dict(entry))
+                        except Exception:
+                            logger.debug("Failed applying in-memory channel model binding", exc_info=True)
+
                 from hermes_cli.config import save_config
                 save_config(cfg)
             except Exception as e:
@@ -11171,6 +11313,18 @@ class GatewayRunner:
             lines.append(t("gateway.model.saved_global"))
         else:
             lines.append(t("gateway.model.session_only_hint"))
+
+        if channel_bind:
+            if persisted_channel_id:
+                lines.append(
+                    f"✓ Saved channel default for `{persisted_channel_id}`. "
+                    "Use /new to start a fresh session on this channel route."
+                )
+            else:
+                lines.append(
+                    "⚠️ Could not determine a channel id to bind. "
+                    "Use `--channel <id>` explicitly."
+                )
 
         return "\n".join(lines)
 

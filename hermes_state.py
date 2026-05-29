@@ -913,7 +913,7 @@ class SessionDB:
         self,
         session_id: str,
         source: str,
-        model: str = None,
+        model: Optional[str] = None,
         model_config: Dict[str, Any] = None,
         system_prompt: str = None,
         user_id: str = None,
@@ -1127,6 +1127,35 @@ class SessionDB:
             conn.execute(
                 "UPDATE sessions SET model = ? WHERE id = ?",
                 (model, session_id),
+            )
+        self._execute_write(_do)
+
+    def update_session_route_metadata(
+        self,
+        session_id: str,
+        *,
+        model: Optional[str] = None,
+        billing_provider: Optional[str] = None,
+        billing_base_url: Optional[str] = None,
+    ) -> None:
+        """Backfill session route metadata without touching token counters.
+
+        Useful for fresh gateway sessions created by ``/new`` before the first
+        model turn has happened: the session row exists, but ``model`` / billing
+        fields are still NULL until token accounting runs. Storing the planned
+        route here makes the fresh session immediately reflect its configured
+        channel binding.
+        """
+        self._insert_session_row(session_id, "unknown", model=model)
+
+        def _do(conn):
+            conn.execute(
+                """UPDATE sessions SET
+                   model = COALESCE(model, ?),
+                   billing_provider = COALESCE(billing_provider, ?),
+                   billing_base_url = COALESCE(billing_base_url, ?)
+                   WHERE id = ?""",
+                (model, billing_provider, billing_base_url, session_id),
             )
         self._execute_write(_do)
 
