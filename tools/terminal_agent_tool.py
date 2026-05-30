@@ -115,6 +115,7 @@ def _run_terminal_agent(
             request_text=task,
             output_root=runtime_home,
             target_home=True,
+            cwd=workdir,
         )
         manifest = apply_result.get("manifest") or {}
         command = _build_runtime_command(selected_runtime, task, max_turns)

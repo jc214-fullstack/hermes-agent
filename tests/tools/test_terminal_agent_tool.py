@@ -59,7 +59,7 @@ def test_dry_run_returns_launch_plan(monkeypatch, tmp_path):
         lambda *args, **kwargs: {
             "manifest_path": str(runtime_home / "hermes-loadout.json"),
             "manifest": {"loadout": "research", "runtime": "claude"},
-            "launch_notice": "[hermes-terminal-loadout]",
+            "launch_notice": "CLAUDE CODE | loadout: research | session: fresh | cwd: tmp_path",
         },
     )
 
@@ -70,7 +70,7 @@ def test_dry_run_returns_launch_plan(monkeypatch, tmp_path):
     assert payload["runtime"] == "claude"
     assert payload["applied_loadout"] == "research"
     assert payload["dry_run"] is True
-    assert payload["launch_notice"] == "[hermes-terminal-loadout]"
+    assert payload["launch_notice"] == "CLAUDE CODE | loadout: research | session: fresh | cwd: tmp_path"
     assert payload["command"][0] == "claude"
 
 
@@ -88,7 +88,7 @@ def test_live_run_executes_codex_and_sets_codex_home(monkeypatch, tmp_path):
         lambda *args, **kwargs: {
             "manifest_path": str(runtime_home / "hermes-loadout.json"),
             "manifest": {"loadout": "builder", "runtime": "codex"},
-            "launch_notice": "[hermes-terminal-loadout]",
+            "launch_notice": "CODEX | loadout: builder | session: fresh | cwd: testdir",
         },
     )
 
