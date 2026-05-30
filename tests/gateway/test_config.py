@@ -413,6 +413,53 @@ class TestLoadGatewayConfig:
             "456": "Therapist mode",
         }
 
+    def test_bridges_discord_channel_model_bindings_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  channel_model_bindings:\n"
+            "    - id: 123\n"
+            "      model: gpt-5.3-codex\n"
+            "      provider: openai-codex\n"
+            "    - id: \"456\"\n"
+            "      model: gpt-5.5\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.DISCORD].extra["channel_model_bindings"] == [
+            {"id": "123", "model": "gpt-5.3-codex", "provider": "openai-codex"},
+            {"id": "456", "model": "gpt-5.5"},
+        ]
+
+    def test_bridges_discord_deep_work_handoff_settings_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  deep_work_channel_id: 1510042356487950376\n"
+            "  deep_work_trigger_phrases:\n"
+            "    - push this to deep work\n"
+            "    - push us off to deep work\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.DISCORD].extra["deep_work_channel_id"] == "1510042356487950376"
+        assert config.platforms[Platform.DISCORD].extra["deep_work_trigger_phrases"] == [
+            "push this to deep work",
+            "push us off to deep work",
+        ]
+
     def test_bridges_discord_history_backfill_settings_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

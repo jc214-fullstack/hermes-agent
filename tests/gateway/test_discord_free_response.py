@@ -927,3 +927,80 @@ async def test_discord_auto_thread_skips_backfill(adapter, monkeypatch):
     adapter._fetch_channel_context.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_deep_work_trigger_routes_from_any_channel_without_mention(adapter, monkeypatch):
+    """Trigger phrase should hand off into Deep Work even when require_mention is true."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+
+    deep_parent = "1510042356487950376"
+    deep_parent_channel = FakeTextChannel(channel_id=int(deep_parent), name="deep-work")
+    deep_thread = FakeThread(channel_id=9001, name="Deep Work — calculator", parent=deep_parent_channel)
+
+    adapter.config.extra["deep_work_channel_id"] = deep_parent
+    adapter.config.extra["deep_work_trigger_phrases"] = ["push this to deep work"]
+    adapter.create_handoff_thread = AsyncMock(return_value=str(deep_thread.id))
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_channel=lambda cid: deep_thread if int(cid) == deep_thread.id else None,
+        fetch_channel=AsyncMock(return_value=deep_thread),
+    )
+
+    source_channel = FakeTextChannel(channel_id=123, name="quick-work")
+    message = make_message(
+        channel=source_channel,
+        content="push this to deep work: draft calculator architecture and test cases",
+        mentions=[],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.create_handoff_thread.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == str(deep_thread.id)
+    assert event.source.thread_id == str(deep_thread.id)
+    assert event.source.parent_chat_id == deep_parent
+    assert event.source.chat_type == "thread"
+    assert "Deep Work handoff from channel 123" in event.text
+    assert "draft calculator architecture and test cases" in event.text
+
+
+@pytest.mark.asyncio
+async def test_auto_run_deep_work_marker_forces_deep_work_thread(adapter, monkeypatch):
+    """[AUTO_RUN_DEEP_WORK] messages must execute in Deep Work, not the source channel."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+
+    deep_parent = "1510042356487950376"
+    deep_parent_channel = FakeTextChannel(channel_id=int(deep_parent), name="deep-work")
+    deep_thread = FakeThread(channel_id=9002, name="Deep Work — DuckDB", parent=deep_parent_channel)
+
+    adapter.config.extra["deep_work_channel_id"] = deep_parent
+    adapter.config.extra["deep_work_trigger_phrases"] = ["push this to deep work"]
+    adapter.create_handoff_thread = AsyncMock(return_value=str(deep_thread.id))
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_channel=lambda cid: deep_thread if int(cid) == deep_thread.id else None,
+        fetch_channel=AsyncMock(return_value=deep_thread),
+    )
+
+    source_channel = FakeTextChannel(channel_id=456, name="quick-work")
+    message = make_message(
+        channel=source_channel,
+        content="[AUTO_RUN_DEEP_WORK] : Explain what DuckDB is",
+        mentions=[],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.create_handoff_thread.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == str(deep_thread.id)
+    assert event.source.thread_id == str(deep_thread.id)
+    assert event.source.parent_chat_id == deep_parent
+    assert event.source.chat_type == "thread"
+    assert "Deep Work handoff from channel 456" in event.text
+    assert "[AUTO_RUN_DEEP_WORK]" not in event.text
+    assert "Explain what DuckDB is" in event.text
+
+

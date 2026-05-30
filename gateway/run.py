@@ -2408,6 +2408,114 @@ class GatewayRunner:
                 return None
         return None
 
+    def _channel_model_binding_for_source(self, source: Optional[SessionSource]) -> Optional[dict]:
+        """Return the most specific persisted channel model binding for a source.
+
+        Exact chat/topic bindings win. For Discord/Slack child conversations,
+        parent channel bindings apply when no explicit child binding exists.
+        """
+        if source is None or not getattr(source, "platform", None):
+            return None
+        config = getattr(self, "config", None)
+        platforms = getattr(config, "platforms", None) if config is not None else None
+        platform_cfg = platforms.get(source.platform) if platforms else None
+        extra = getattr(platform_cfg, "extra", None) if platform_cfg is not None else None
+        raw_bindings = extra.get("channel_model_bindings") if isinstance(extra, dict) else None
+        if not isinstance(raw_bindings, list) or not raw_bindings:
+            return None
+
+        direct_ids: list[str] = []
+        for attr in ("topic_id", "chat_id"):
+            value = str(getattr(source, attr, "") or "").strip()
+            if value:
+                direct_ids.append(value)
+        parent_id = str(getattr(source, "parent_chat_id", "") or "").strip()
+
+        normalized: dict[str, dict] = {}
+        for entry in raw_bindings:
+            if not isinstance(entry, dict):
+                continue
+            entry_id = str(entry.get("id", "") or "").strip()
+            if not entry_id:
+                continue
+            normalized[entry_id] = entry
+
+        for entry_id in direct_ids:
+            if entry_id in normalized:
+                return normalized[entry_id]
+        if parent_id and parent_id in normalized:
+            return normalized[parent_id]
+        return None
+
+    def _apply_channel_model_binding(
+        self,
+        source: Optional[SessionSource],
+        model: str,
+        runtime_kwargs: dict,
+    ) -> tuple[str, dict]:
+        """Apply persisted channel defaults to a freshly resolved session runtime."""
+        binding = self._channel_model_binding_for_source(source)
+        if not binding:
+            return model, runtime_kwargs
+
+        bound_model = str(binding.get("model") or "").strip() or model
+        runtime = dict(runtime_kwargs)
+        requested_provider = str(binding.get("provider") or runtime.get("provider") or "").strip() or None
+        requested_base_url = str(binding.get("base_url") or runtime.get("base_url") or "").strip() or None
+        requested_api_key = binding.get("api_key") or None
+        requested_api_mode = str(binding.get("api_mode") or runtime.get("api_mode") or "").strip() or None
+
+        current_provider = str(runtime.get("provider") or "").strip() or None
+        current_base_url = str(runtime.get("base_url") or "").strip() or None
+        current_api_key = runtime.get("api_key") or None
+
+        needs_runtime_resolution = bool(
+            requested_api_key
+            or requested_provider != current_provider
+            or requested_base_url != current_base_url
+            or not current_api_key
+        )
+
+        if needs_runtime_resolution and (requested_provider or requested_base_url or requested_api_key):
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                resolved_runtime = resolve_runtime_provider(
+                    requested=requested_provider,
+                    explicit_base_url=requested_base_url,
+                    explicit_api_key=requested_api_key,
+                )
+                runtime.update({
+                    "api_key": resolved_runtime.get("api_key"),
+                    "base_url": resolved_runtime.get("base_url"),
+                    "provider": resolved_runtime.get("provider"),
+                    "api_mode": resolved_runtime.get("api_mode"),
+                    "command": resolved_runtime.get("command"),
+                    "args": resolved_runtime.get("args"),
+                    "credential_pool": resolved_runtime.get("credential_pool"),
+                })
+            except Exception as exc:
+                logger.warning(
+                    "Failed to resolve channel model binding for %s:%s (%s): %s",
+                    getattr(getattr(source, "platform", None), "value", "unknown"),
+                    getattr(source, "chat_id", None) or getattr(source, "topic_id", None) or "unknown",
+                    binding.get("id"),
+                    exc,
+                )
+                return model, runtime_kwargs
+
+        if requested_api_mode:
+            runtime["api_mode"] = requested_api_mode
+
+        logger.info(
+            "Applied channel model binding: source=%s binding=%s model=%s provider=%s",
+            getattr(getattr(source, "platform", None), "value", "unknown"),
+            binding.get("id"),
+            bound_model,
+            runtime.get("provider"),
+        )
+        return bound_model, runtime
+
     def _resolve_session_agent_runtime(
         self,
         *,
@@ -2467,6 +2575,7 @@ class GatewayRunner:
                 runtime_model,
             )
             model = runtime_model
+        model, runtime_kwargs = self._apply_channel_model_binding(source, model, runtime_kwargs)
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
