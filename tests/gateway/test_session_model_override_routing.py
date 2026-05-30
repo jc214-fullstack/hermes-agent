@@ -66,6 +66,12 @@ def _make_runner():
     return runner
 
 
+def _attach_channel_bindings(runner, platform, bindings):
+    runner.config = types.SimpleNamespace(
+        platforms={platform: types.SimpleNamespace(extra={"channel_model_bindings": bindings})}
+    )
+
+
 def _codex_override():
     return {
         "model": "gpt-5.4",
@@ -260,4 +266,135 @@ fallback_providers:
     assert runtime_kwargs["api_key"] == "env-secret"
     assert runtime_kwargs["base_url"] == "https://fallback.example/v1"
     assert runtime_kwargs["model"] == "fallback-model"
+
+
+def test_channel_model_binding_applies_parent_binding_to_new_discord_thread_session(monkeypatch):
+    runner = _make_runner()
+    _attach_channel_bindings(
+        runner,
+        Platform.DISCORD,
+        [{"id": "1509377909121618063", "model": "gpt-5.3-codex", "provider": "openai-codex"}],
+    )
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "api_key": "***",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "command": None,
+            "args": [],
+            "credential_pool": None,
+        },
+    )
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="1510015595939237898",
+        parent_chat_id="1509377909121618063",
+        chat_type="group",
+        user_id="user-1",
+    )
+
+    model, runtime_kwargs = runner._resolve_session_agent_runtime(
+        source=source,
+        session_key="agent:main:discord:group:1510015595939237898:user-1",
+        user_config={"model": {"default": "gpt-5.4", "provider": "openai-codex"}},
+    )
+
+    assert model == "gpt-5.3-codex"
+    assert runtime_kwargs["provider"] == "openai-codex"
+    assert runtime_kwargs["api_mode"] == "codex_responses"
+
+
+def test_channel_model_binding_prefers_exact_thread_binding_over_parent(monkeypatch):
+    runner = _make_runner()
+    _attach_channel_bindings(
+        runner,
+        Platform.DISCORD,
+        [
+            {"id": "1509377909121618063", "model": "gpt-5.3-codex", "provider": "openai-codex"},
+            {"id": "1510015595939237898", "model": "gpt-5.5", "provider": "openai-codex"},
+        ],
+    )
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "api_key": "***",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "command": None,
+            "args": [],
+            "credential_pool": None,
+        },
+    )
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="1510015595939237898",
+        parent_chat_id="1509377909121618063",
+        chat_type="group",
+        user_id="user-1",
+    )
+
+    model, runtime_kwargs = runner._resolve_session_agent_runtime(
+        source=source,
+        session_key="agent:main:discord:group:1510015595939237898:user-1",
+        user_config={"model": {"default": "gpt-5.4", "provider": "openai-codex"}},
+    )
+
+    assert model == "gpt-5.5"
+    assert runtime_kwargs["provider"] == "openai-codex"
+
+
+def test_session_override_still_beats_channel_model_binding(monkeypatch):
+    runner = _make_runner()
+    _attach_channel_bindings(
+        runner,
+        Platform.DISCORD,
+        [{"id": "1509377909121618063", "model": "gpt-5.3-codex", "provider": "openai-codex"}],
+    )
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "api_key": "***",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "command": None,
+            "args": [],
+            "credential_pool": None,
+        },
+    )
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="1510015595939237898",
+        parent_chat_id="1509377909121618063",
+        chat_type="group",
+        user_id="user-1",
+    )
+    session_key = "agent:main:discord:group:1510015595939237898:user-1"
+    runner._session_model_overrides[session_key] = {
+        "model": "gpt-5.5",
+        "provider": "openai-codex",
+        "api_mode": "codex_responses",
+    }
+
+    model, runtime_kwargs = runner._resolve_session_agent_runtime(
+        source=source,
+        session_key=session_key,
+        user_config={"model": {"default": "gpt-5.4", "provider": "openai-codex"}},
+    )
+
+    assert model == "gpt-5.5"
+    assert runtime_kwargs["provider"] == "openai-codex"
+    assert runtime_kwargs["api_mode"] == "codex_responses"
 

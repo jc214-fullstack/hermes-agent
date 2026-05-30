@@ -765,9 +765,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 if adapter_self._dedup.is_duplicate(str(message.id)):
                     return
 
-                # Always ignore our own messages
+                # Ignore our own messages by default, but allow explicit
+                # self-triggered Deep Work kickoffs tagged with [AUTO_RUN_DEEP_WORK].
+                # This enables bot-authored transport messages to intentionally
+                # become executable inbound turns without opening the door to loops.
+                own_auto_run_deep_work = False
                 if message.author == self._client.user:
-                    return
+                    own_content = (getattr(message, "content", "") or "").strip()
+                    own_auto_run_deep_work = "[AUTO_RUN_DEEP_WORK]" in own_content
+                    if not own_auto_run_deep_work:
+                        return
 
                 # Ignore Discord system messages (thread renames, pins, member joins, etc.)
                 # Allow both default and reply types — replies have a distinct MessageType.
@@ -781,7 +788,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Must run BEFORE the user allowlist check so that bots
                 # permitted by DISCORD_ALLOW_BOTS are not rejected for
                 # not being in DISCORD_ALLOWED_USERS (fixes #4466).
-                if getattr(message.author, "bot", False):
+                if getattr(message.author, "bot", False) and not own_auto_run_deep_work:
                     allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
                     if allow_bots == "none":
                         return
@@ -790,6 +797,11 @@ class DiscordAdapter(BasePlatformAdapter):
                             return
                     # "all" falls through; bot is permitted — skip the
                     # human-user allowlist below (bots aren't in it).
+                elif getattr(message.author, "bot", False):
+                    # Self-authored [AUTO_RUN_DEEP_WORK] transport messages are
+                    # intentionally executable; bypass DISCORD_ALLOW_BOTS so the
+                    # bot can hand them off without enabling all bot messages.
+                    pass
                 else:
                     # Non-bot: enforce the configured user/role allowlists.
                     # Pass guild + is_dm so role checks are scoped to the
@@ -3749,6 +3761,52 @@ class DiscordAdapter(BasePlatformAdapter):
         except (ValueError, TypeError):
             return 50
 
+    def _discord_deep_work_channel_id(self) -> str:
+        """Return the configured Discord channel ID used as Deep Work parent."""
+        configured = self.config.extra.get("deep_work_channel_id")
+        if configured is None:
+            configured = os.getenv("DISCORD_DEEP_WORK_CHANNEL_ID", "")
+        return str(configured).strip() if configured is not None else ""
+
+    def _discord_deep_work_trigger_phrases(self) -> list[str]:
+        """Return normalized trigger phrases that request Deep Work handoff."""
+        configured = self.config.extra.get("deep_work_trigger_phrases")
+        if configured is None:
+            configured = os.getenv("DISCORD_DEEP_WORK_TRIGGER_PHRASES", "")
+
+        raw_phrases: list[str] = []
+        if isinstance(configured, list):
+            raw_phrases = [str(item).strip() for item in configured if str(item).strip()]
+        else:
+            text = str(configured).strip() if configured is not None else ""
+            if text:
+                raw_phrases = [part.strip() for part in text.split(",") if part.strip()]
+
+        if not raw_phrases:
+            raw_phrases = ["push this to deep work"]
+
+        seen = set()
+        phrases: list[str] = []
+        for phrase in raw_phrases:
+            normalized = " ".join(phrase.lower().split())
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                phrases.append(normalized)
+        return phrases
+
+    @staticmethod
+    def _strip_deep_work_trigger(text: str, trigger: str) -> str:
+        """Remove one trigger phrase occurrence from text and return cleaned text."""
+        if not text:
+            return ""
+        lowered = text.lower()
+        idx = lowered.find(trigger)
+        if idx < 0:
+            return text.strip()
+        cleaned = (text[:idx] + text[idx + len(trigger):]).strip()
+        cleaned = cleaned.lstrip("-:;,. ").rstrip()
+        return cleaned
+
     async def _fetch_channel_context(
         self,
         channel: Any,
@@ -4510,6 +4568,7 @@ class DiscordAdapter(BasePlatformAdapter):
             parent_channel_id = self._get_parent_channel_id(message.channel)
 
         is_voice_linked_channel = False
+        auto_threaded_channel = None
 
         # Save mention-stripped text before auto-threading since create_thread()
         # can clobber message.content, breaking /command detection in channels.
@@ -4532,6 +4591,77 @@ class DiscordAdapter(BasePlatformAdapter):
             normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
             normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
             message.content = normalized_content
+
+        # Deep Work phrase-triggered handoff: route this turn into a new thread
+        # under the configured Deep Work parent channel, even if the source
+        # channel would normally require @mention.  Bot-authored
+        # [AUTO_RUN_DEEP_WORK] transport messages force the same handoff path so
+        # an auto-run cannot execute in the source/quick-work channel.
+        auto_run_marker = "[AUTO_RUN_DEEP_WORK]"
+        auto_run_deep_work = auto_run_marker in normalized_content
+        if auto_run_deep_work:
+            normalized_content = normalized_content.replace(auto_run_marker, "", 1).strip()
+            normalized_content = normalized_content.lstrip("-:;,. ").rstrip()
+            message.content = normalized_content
+
+        normalized_lower = " ".join(normalized_content.lower().split())
+        matched_trigger = auto_run_marker if auto_run_deep_work else None
+        if matched_trigger is None:
+            for phrase in self._discord_deep_work_trigger_phrases():
+                if phrase and phrase in normalized_lower:
+                    matched_trigger = phrase
+                    break
+
+        if matched_trigger:
+            deep_parent_id = self._discord_deep_work_channel_id()
+            if deep_parent_id:
+                source_channel_id = str(getattr(message.channel, "id", ""))
+                source_thread_id = thread_id
+                source_msg_id = str(getattr(message, "id", ""))
+                user_name = getattr(message.author, "display_name", None) or getattr(message.author, "name", "user")
+
+                task_text = self._strip_deep_work_trigger(normalized_content, matched_trigger)
+                if not task_text:
+                    task_text = "Continue this task in Deep Work. Ask one clarification question if needed and proceed."
+
+                thread_name_seed = task_text[:56].strip() or "deep-work-handoff"
+                thread_name = f"Deep Work — {thread_name_seed}"[:80]
+
+                routed_thread_id = await self.create_handoff_thread(deep_parent_id, thread_name)
+                if routed_thread_id and self._client is not None:
+                    routed_channel = self._client.get_channel(int(routed_thread_id))
+                    if routed_channel is None:
+                        routed_channel = await self._client.fetch_channel(int(routed_thread_id))
+                    if routed_channel is not None:
+                        auto_threaded_channel = routed_channel
+                        mention_prefix = True
+                        is_thread = True
+                        thread_id = str(routed_channel.id)
+                        parent_channel_id = str(deep_parent_id)
+                        self._threads.mark(thread_id)
+
+                        normalized_content = (
+                            f"[Deep Work handoff from channel {source_channel_id}"
+                            f" thread {source_thread_id or 'none'}"
+                            f" message {source_msg_id}"
+                            f" by {user_name}]\n"
+                            f"{task_text}"
+                        )
+                        message.content = normalized_content
+                        logger.info(
+                            "[%s] Deep Work handoff trigger matched ('%s'): source=%s -> deep_parent=%s thread=%s",
+                            self.name,
+                            matched_trigger,
+                            source_channel_id,
+                            deep_parent_id,
+                            thread_id,
+                        )
+            else:
+                logger.warning(
+                    "[%s] Deep Work trigger matched but no deep_work_channel_id configured",
+                    self.name,
+                )
+
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
@@ -4586,7 +4716,6 @@ class DiscordAdapter(BasePlatformAdapter):
         # @mention in a text channel so each conversation is isolated (like Slack).
         # Messages already inside threads or DMs are unaffected.
         # no_thread_channels: channels where bot responds directly without thread.
-        auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}

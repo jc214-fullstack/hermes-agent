@@ -1684,6 +1684,7 @@ DEFAULT_CONFIG = {
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "channel_prompts": {},         # Per-channel ephemeral system prompts
+        "channel_model_bindings": [],  # Per-channel default model/provider bindings
     },
 
     # Discord platform settings (gateway mode)
@@ -1697,6 +1698,12 @@ DEFAULT_CONFIG = {
         "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
         "channel_prompts": {},         # Per-channel ephemeral system prompts (forum parents apply to child threads)
+        "channel_model_bindings": [],  # Per-channel default model/provider bindings (threads inherit parent unless explicitly pinned)
+        # Deep Work handoff routing: when a message contains one of
+        # deep_work_trigger_phrases, route that turn to a newly created thread
+        # under deep_work_channel_id and continue there.
+        "deep_work_channel_id": "",
+        "deep_work_trigger_phrases": ["push this to deep work"],
         # Opt-in DM role-based auth (#12136). By default, DISCORD_ALLOWED_ROLES
         # authorizes only guild messages in the role's own guild — DMs require
         # DISCORD_ALLOWED_USERS. Set dm_role_auth_guild to a guild ID to also

@@ -894,6 +894,24 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = {str(k): v for k, v in channel_prompts.items()}
                     else:
                         bridged["channel_prompts"] = channel_prompts
+                if plat in {Platform.DISCORD, Platform.SLACK} and "channel_model_bindings" in platform_cfg:
+                    raw_bindings = platform_cfg["channel_model_bindings"]
+                    if isinstance(raw_bindings, list):
+                        normalized_bindings = []
+                        for entry in raw_bindings:
+                            if not isinstance(entry, dict):
+                                continue
+                            normalized_entry = dict(entry)
+                            if "id" in normalized_entry:
+                                normalized_entry["id"] = str(normalized_entry["id"])
+                            normalized_bindings.append(normalized_entry)
+                        bridged["channel_model_bindings"] = normalized_bindings
+                    else:
+                        bridged["channel_model_bindings"] = raw_bindings
+                if plat == Platform.DISCORD and "deep_work_channel_id" in platform_cfg:
+                    bridged["deep_work_channel_id"] = str(platform_cfg["deep_work_channel_id"])
+                if plat == Platform.DISCORD and "deep_work_trigger_phrases" in platform_cfg:
+                    bridged["deep_work_trigger_phrases"] = platform_cfg["deep_work_trigger_phrases"]
                 if "gateway_restart_notification" in platform_cfg:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
                 enabled_was_explicit = "enabled" in platform_cfg
