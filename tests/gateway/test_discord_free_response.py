@@ -1057,6 +1057,38 @@ async def test_deep_work_thread_does_not_create_recursive_handoff(adapter, monke
     assert event.source.thread_id == str(source_thread.id)
     assert event.source.parent_chat_id == deep_parent
 
+
+@pytest.mark.asyncio
+async def test_auto_run_marker_in_deep_work_thread_does_not_create_nested_handoff(adapter, monkeypatch):
+    """A Deep Work starter auto-run message should execute in-place, not spawn a second thread."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+
+    deep_parent = "1510042356487950376"
+    deep_parent_channel = FakeTextChannel(channel_id=int(deep_parent), name="deep-work")
+    source_thread = FakeThread(channel_id=9006, name="Deep Work — existing", parent=deep_parent_channel)
+
+    adapter.config.extra["deep_work_channel_id"] = deep_parent
+    adapter.config.extra["deep_work_trigger_phrases"] = ["push this to deep work"]
+    adapter.create_handoff_thread = AsyncMock(return_value="9007")
+
+    message = make_message(
+        channel=source_thread,
+        content="[AUTO_RUN_DEEP_WORK]\nRun the heartbeat rollout",
+        mentions=[],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.create_handoff_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == str(source_thread.id)
+    assert event.source.thread_id == str(source_thread.id)
+    assert event.source.parent_chat_id == deep_parent
+    assert "[AUTO_RUN_DEEP_WORK]" not in event.text
+    assert "Run the heartbeat rollout" in event.text
+
+
 @pytest.mark.asyncio
 async def test_configured_handoff_route_targets_bound_parent_channel(adapter, monkeypatch):
     """Generic handoff routes should create a target-parent thread for model-bound pipelines."""

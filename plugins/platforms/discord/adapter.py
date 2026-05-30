@@ -4735,14 +4735,23 @@ class DiscordAdapter(BasePlatformAdapter):
                     or (parent_channel_id and str(parent_channel_id) == target_parent_id)
                 )
             )
-            if in_target_channel and not auto_run_handoff:
-                logger.info(
-                    "[%s] Ignoring recursive %s handoff trigger in target channel/thread: source=%s parent=%s",
-                    self.name,
-                    route_label,
-                    source_channel_id,
-                    parent_channel_id,
-                )
+            if in_target_channel:
+                if auto_run_handoff:
+                    logger.info(
+                        "[%s] Running %s auto-run payload in target channel/thread without creating nested handoff: source=%s parent=%s",
+                        self.name,
+                        route_label,
+                        source_channel_id,
+                        parent_channel_id,
+                    )
+                else:
+                    logger.info(
+                        "[%s] Ignoring recursive %s handoff trigger in target channel/thread: source=%s parent=%s",
+                        self.name,
+                        route_label,
+                        source_channel_id,
+                        parent_channel_id,
+                    )
                 matched_trigger = None
             elif target_parent_id:
                 source_thread_id = thread_id
