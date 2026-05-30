@@ -91,19 +91,21 @@ def test_launch_dry_run_applies_loadout_and_builds_command(monkeypatch, capsys, 
     home.mkdir()
     workdir = tmp_path / "project"
     workdir.mkdir()
+    captured = {}
 
     monkeypatch.setitem(loadout_cli.DEFAULT_RUNTIME_HOMES, "codex", home)
     monkeypatch.setattr(loadout_cli.shutil, "which", lambda _: "/usr/bin/codex")
-    monkeypatch.setattr(
-        loadout_cli,
-        "_apply_loadout",
-        lambda *args, **kwargs: {
+
+    def fake_apply(*args, **kwargs):
+        captured.update(kwargs)
+        return {
             "output_root": str(home),
             "manifest_path": str(home / "hermes-loadout.json"),
             "manifest": {"runtime": "codex", "loadout": "research"},
-            "launch_notice": "[hermes-terminal-loadout]",
-        },
-    )
+            "launch_notice": "CODEX | loadout: research | session: fresh | cwd: project",
+        }
+
+    monkeypatch.setattr(loadout_cli, "_apply_loadout", fake_apply)
 
     args = argparse.Namespace(
         repo=str(repo),
@@ -121,7 +123,8 @@ def test_launch_dry_run_applies_loadout_and_builds_command(monkeypatch, capsys, 
     assert payload["applied_loadout"] == "research"
     assert payload["command"] == ["/usr/bin/codex", "exec", "--help"]
     assert payload["cwd"] == str(workdir)
-    assert payload["launch_notice"] == "[hermes-terminal-loadout]"
+    assert payload["launch_notice"] == "CODEX | loadout: research | session: fresh | cwd: project"
+    assert captured["cwd"] == str(workdir)
 
 
 def test_launch_rejects_claude_custom_home(tmp_path):

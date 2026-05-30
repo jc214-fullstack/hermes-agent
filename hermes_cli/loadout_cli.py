@@ -105,6 +105,7 @@ def _apply_loadout(
     request_text: str | None,
     output_root: Path,
     target_home: bool,
+    cwd: str | None = None,
 ) -> dict[str, Any]:
     if not loadout and not request_text:
         raise RuntimeError("Provide either --loadout or --request")
@@ -120,6 +121,8 @@ def _apply_loadout(
         cmd += ["--loadout", loadout]
     if request_text:
         cmd += ["--request", request_text]
+    if cwd:
+        cmd += ["--cwd", cwd]
     if target_home:
         cmd.append("--target-home")
     result = _run_repo_script(repo_root, "apply_loadout.py", cmd)
@@ -196,6 +199,7 @@ def _cmd_apply(args) -> int:
         request_text=args.request,
         output_root=output_root,
         target_home=args.target_home,
+        cwd=args.cwd if hasattr(args, "cwd") else None,
     )
     payload = {
         "runtime": runtime,
@@ -224,6 +228,7 @@ def _cmd_launch(args) -> int:
     runtime = args.runtime
     home = _runtime_home(runtime, args.home)
     _claude_home_override_allowed(runtime, home)
+    cwd = str(Path(args.cwd).expanduser()) if args.cwd else os.getcwd()
     result = _apply_loadout(
         repo_root,
         runtime,
@@ -231,6 +236,7 @@ def _cmd_launch(args) -> int:
         request_text=args.request,
         output_root=home,
         target_home=True,
+        cwd=cwd,
     )
     binary = shutil.which(RUNTIME_BINARIES[runtime])
     if not binary:
@@ -238,7 +244,6 @@ def _cmd_launch(args) -> int:
 
     child_args = list(args.arg or [])
     cmd = [binary, *child_args]
-    cwd = str(Path(args.cwd).expanduser()) if args.cwd else os.getcwd()
     env = os.environ.copy()
     if runtime == "codex":
         env["CODEX_HOME"] = str(home)
