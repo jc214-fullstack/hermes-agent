@@ -460,6 +460,36 @@ class TestLoadGatewayConfig:
             "push us off to deep work",
         ]
 
+    def test_bridges_discord_handoff_routes_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  handoff_routes:\n"
+            "    - label: Research\n"
+            "      target_channel_id: 1510042356487950376\n"
+            "      trigger_phrases:\n"
+            "        - push this to research\n"
+            "      auto_run_marker: '[AUTO_RUN_RESEARCH]'\n"
+            "      thread_name_prefix: Research\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.DISCORD].extra["handoff_routes"] == [
+            {
+                "label": "Research",
+                "target_channel_id": "1510042356487950376",
+                "trigger_phrases": ["push this to research"],
+                "auto_run_marker": "[AUTO_RUN_RESEARCH]",
+                "thread_name_prefix": "Research",
+            }
+        ]
+
     def test_bridges_discord_history_backfill_settings_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

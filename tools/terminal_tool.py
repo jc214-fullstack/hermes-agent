@@ -1718,6 +1718,48 @@ def _resolve_notification_flag_conflict(
     return watch_patterns, ""
 
 
+def _looks_like_gateway_restart_command(command: str) -> bool:
+    """Return True for shell commands that invoke `hermes gateway restart`."""
+    if not isinstance(command, str):
+        return False
+    return re.search(r"(?:^|[;&|()\s])hermes\s+gateway\s+restart(?:$|[;&|()\s])", command) is not None
+
+
+def _is_deep_work_session_context() -> bool:
+    """Best-effort check for Discord Deep Work sessions before dangerous local ops."""
+    try:
+        from gateway.session_context import get_session_env
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "")
+        chat_name = get_session_env("HERMES_SESSION_CHAT_NAME", "").lower()
+    except Exception:
+        return False
+
+    if platform != "discord":
+        return False
+
+    deep_parent_id = os.getenv("DISCORD_DEEP_WORK_CHANNEL_ID", "").strip()
+    if deep_parent_id and deep_parent_id in {chat_id, thread_id}:
+        return True
+
+    # Thread chat names are formatted like "Guild / #deep-work / Thread".
+    return "deep-work" in chat_name or "deep work" in chat_name
+
+
+def _deep_work_gateway_restart_guard(command: str) -> str | None:
+    """Block Deep Work agents from restarting the gateway that is carrying them."""
+    if os.getenv("HERMES_ALLOW_DEEP_WORK_GATEWAY_RESTART", "").lower() in {"1", "true", "yes"}:
+        return None
+    if _looks_like_gateway_restart_command(command) and _is_deep_work_session_context():
+        return (
+            "Blocked: Deep Work sessions may not run `hermes gateway restart` because it can "
+            "kill the active report-back channel. Ask Mike to approve the restart from a non-Deep-Work "
+            "session, or set HERMES_ALLOW_DEEP_WORK_GATEWAY_RESTART=1 for an explicit override."
+        )
+    return None
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -1773,6 +1815,15 @@ def terminal_tool(
             }, ensure_ascii=False)
 
         # Get configuration
+        restart_guard_error = _deep_work_gateway_restart_guard(command)
+        if restart_guard_error:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": restart_guard_error,
+                "status": "blocked",
+            }, ensure_ascii=False)
+
         config = _get_env_config()
         env_type = config["env_type"]
 
