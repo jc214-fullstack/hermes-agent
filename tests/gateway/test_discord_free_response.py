@@ -1004,3 +1004,100 @@ async def test_auto_run_deep_work_marker_forces_deep_work_thread(adapter, monkey
     assert "Explain what DuckDB is" in event.text
 
 
+@pytest.mark.asyncio
+async def test_deep_work_trigger_must_be_start_anchored(adapter, monkeypatch):
+    """Mentioning the trigger phrase in explanatory text must not create a handoff."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+
+    adapter.config.extra["deep_work_channel_id"] = "1510042356487950376"
+    adapter.config.extra["deep_work_trigger_phrases"] = ["push this to deep work"]
+    adapter.create_handoff_thread = AsyncMock(return_value="9003")
+
+    source_channel = FakeTextChannel(channel_id=123, name="quick-work")
+    message = make_message(
+        channel=source_channel,
+        content='When I say "push this to deep work" I mean the explicit command only.',
+        mentions=[],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.create_handoff_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "123"
+    assert event.source.chat_type == "group"
+
+
+@pytest.mark.asyncio
+async def test_deep_work_thread_does_not_create_recursive_handoff(adapter, monkeypatch):
+    """A Deep Work thread should treat trigger wording as normal text, not spawn another thread."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+
+    deep_parent = "1510042356487950376"
+    deep_parent_channel = FakeTextChannel(channel_id=int(deep_parent), name="deep-work")
+    source_thread = FakeThread(channel_id=9004, name="Deep Work — existing", parent=deep_parent_channel)
+
+    adapter.config.extra["deep_work_channel_id"] = deep_parent
+    adapter.config.extra["deep_work_trigger_phrases"] = ["push this to deep work"]
+    adapter.create_handoff_thread = AsyncMock(return_value="9005")
+
+    message = make_message(
+        channel=source_thread,
+        content="push this to deep work: nested work should stay here",
+        mentions=[],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.create_handoff_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == str(source_thread.id)
+    assert event.source.thread_id == str(source_thread.id)
+    assert event.source.parent_chat_id == deep_parent
+
+@pytest.mark.asyncio
+async def test_configured_handoff_route_targets_bound_parent_channel(adapter, monkeypatch):
+    """Generic handoff routes should create a target-parent thread for model-bound pipelines."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+
+    target_parent = "777777"
+    target_parent_channel = FakeTextChannel(channel_id=int(target_parent), name="research")
+    target_thread = FakeThread(channel_id=9100, name="Research — report", parent=target_parent_channel)
+
+    adapter.config.extra["handoff_routes"] = [
+        {
+            "label": "Research",
+            "target_channel_id": target_parent,
+            "trigger_phrases": ["push this to research"],
+            "auto_run_marker": "[AUTO_RUN_RESEARCH]",
+            "thread_name_prefix": "Research",
+        }
+    ]
+    adapter.create_handoff_thread = AsyncMock(return_value=str(target_thread.id))
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_channel=lambda cid: target_thread if int(cid) == target_thread.id else None,
+        fetch_channel=AsyncMock(return_value=target_thread),
+    )
+
+    source_channel = FakeTextChannel(channel_id=321, name="quick-work")
+    message = make_message(
+        channel=source_channel,
+        content="push this to research: verify the Discord pipeline",
+        mentions=[],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.create_handoff_thread.assert_awaited_once_with(target_parent, "Research — verify the Discord pipeline")
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == str(target_thread.id)
+    assert event.source.thread_id == str(target_thread.id)
+    assert event.source.parent_chat_id == target_parent
+    assert event.source.chat_type == "thread"
+    assert "Research handoff from channel 321" in event.text
+    assert "verify the Discord pipeline" in event.text
+

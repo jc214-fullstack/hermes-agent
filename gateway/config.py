@@ -908,6 +908,21 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_model_bindings"] = normalized_bindings
                     else:
                         bridged["channel_model_bindings"] = raw_bindings
+                if plat == Platform.DISCORD and "handoff_routes" in platform_cfg:
+                    raw_routes = platform_cfg["handoff_routes"]
+                    if isinstance(raw_routes, list):
+                        normalized_routes = []
+                        for entry in raw_routes:
+                            if not isinstance(entry, dict):
+                                continue
+                            normalized_entry = dict(entry)
+                            for key in ("target_channel_id", "target_id", "channel_id"):
+                                if key in normalized_entry:
+                                    normalized_entry[key] = str(normalized_entry[key])
+                            normalized_routes.append(normalized_entry)
+                        bridged["handoff_routes"] = normalized_routes
+                    else:
+                        bridged["handoff_routes"] = raw_routes
                 if plat == Platform.DISCORD and "deep_work_channel_id" in platform_cfg:
                     bridged["deep_work_channel_id"] = str(platform_cfg["deep_work_channel_id"])
                 if plat == Platform.DISCORD and "deep_work_trigger_phrases" in platform_cfg:

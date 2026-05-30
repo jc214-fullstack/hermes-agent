@@ -766,14 +766,26 @@ class DiscordAdapter(BasePlatformAdapter):
                     return
 
                 # Ignore our own messages by default, but allow explicit
-                # self-triggered Deep Work kickoffs tagged with [AUTO_RUN_DEEP_WORK].
-                # This enables bot-authored transport messages to intentionally
-                # become executable inbound turns without opening the door to loops.
-                own_auto_run_deep_work = False
-                if message.author == self._client.user:
+                # self-triggered handoff kickoffs tagged with a configured
+                # auto-run marker (legacy: [AUTO_RUN_DEEP_WORK]). This lets
+                # bot-authored transport messages intentionally become
+                # executable inbound turns without opening the door to loops.
+                own_auto_run_handoff = False
+                self_user = getattr(self._client, "user", None)
+                author_is_self = bool(
+                    self_user is not None
+                    and (
+                        message.author == self_user
+                        or str(getattr(message.author, "id", "")) == str(getattr(self_user, "id", ""))
+                    )
+                )
+                if author_is_self:
                     own_content = (getattr(message, "content", "") or "").strip()
-                    own_auto_run_deep_work = "[AUTO_RUN_DEEP_WORK]" in own_content
-                    if not own_auto_run_deep_work:
+                    own_auto_run_handoff = any(
+                        marker in own_content
+                        for marker in adapter_self._discord_handoff_auto_run_markers()
+                    )
+                    if not own_auto_run_handoff:
                         return
 
                 # Ignore Discord system messages (thread renames, pins, member joins, etc.)
@@ -788,7 +800,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Must run BEFORE the user allowlist check so that bots
                 # permitted by DISCORD_ALLOW_BOTS are not rejected for
                 # not being in DISCORD_ALLOWED_USERS (fixes #4466).
-                if getattr(message.author, "bot", False) and not own_auto_run_deep_work:
+                if getattr(message.author, "bot", False) and not own_auto_run_handoff:
                     allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
                     if allow_bots == "none":
                         return
@@ -798,7 +810,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     # "all" falls through; bot is permitted — skip the
                     # human-user allowlist below (bots aren't in it).
                 elif getattr(message.author, "bot", False):
-                    # Self-authored [AUTO_RUN_DEEP_WORK] transport messages are
+                    # Self-authored auto-run transport messages are
                     # intentionally executable; bypass DISCORD_ALLOW_BOTS so the
                     # bot can hand them off without enabling all bot messages.
                     pass
@@ -3783,7 +3795,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 raw_phrases = [part.strip() for part in text.split(",") if part.strip()]
 
         if not raw_phrases:
-            raw_phrases = ["push this to deep work"]
+            raw_phrases = [
+                "push this to deep work",
+                "push this to a deep work channel",
+                "push this to the deep work channel",
+            ]
 
         seen = set()
         phrases: list[str] = []
@@ -3794,16 +3810,111 @@ class DiscordAdapter(BasePlatformAdapter):
                 phrases.append(normalized)
         return phrases
 
+    def _discord_handoff_routes(self) -> list[dict[str, Any]]:
+        """Return configured Discord handoff routes with Deep Work as legacy route.
+
+        Config format (``discord.handoff_routes``):
+
+            - label: "Deep Work"
+              target_channel_id: "1510042356487950376"
+              trigger_phrases: ["push this to deep work"]
+              auto_run_marker: "[AUTO_RUN_DEEP_WORK]"
+              thread_name_prefix: "Deep Work"
+
+        The target channel's ``channel_model_bindings`` entry supplies the model
+        for the created thread via parent-channel inheritance.
+        """
+        raw_routes = self.config.extra.get("handoff_routes")
+        routes: list[dict[str, Any]] = []
+        if isinstance(raw_routes, list):
+            for raw in raw_routes:
+                if not isinstance(raw, dict):
+                    continue
+                target = str(
+                    raw.get("target_channel_id")
+                    or raw.get("target_id")
+                    or raw.get("channel_id")
+                    or ""
+                ).strip()
+                if not target:
+                    continue
+                route = dict(raw)
+                route["target_channel_id"] = target
+                routes.append(route)
+
+        # Backward compatibility for the existing Deep Work shortcut.
+        deep_work_target = self._discord_deep_work_channel_id()
+        if deep_work_target and not any(
+            str(route.get("target_channel_id") or "").strip() == deep_work_target
+            for route in routes
+        ):
+            routes.append({
+                "label": "Deep Work",
+                "target_channel_id": deep_work_target,
+                "trigger_phrases": self._discord_deep_work_trigger_phrases(),
+                "auto_run_marker": "[AUTO_RUN_DEEP_WORK]",
+                "thread_name_prefix": "Deep Work",
+            })
+        return routes
+
+    def _discord_handoff_auto_run_markers(self) -> set[str]:
+        """Return explicit bot-authored markers allowed to enter handoff routing."""
+        markers: set[str] = set()
+        for route in self._discord_handoff_routes():
+            marker = str(route.get("auto_run_marker") or "").strip()
+            if marker:
+                markers.add(marker)
+        markers.add("[AUTO_RUN_DEEP_WORK]")
+        return markers
+
+    @staticmethod
+    def _normalize_handoff_trigger_phrases(raw_phrases: Any) -> list[str]:
+        """Normalize trigger phrase config from YAML list or comma-separated string."""
+        if isinstance(raw_phrases, list):
+            candidates = [str(item).strip() for item in raw_phrases if str(item).strip()]
+        else:
+            text = str(raw_phrases or "").strip()
+            candidates = [part.strip() for part in text.split(",") if part.strip()] if text else []
+        seen: set[str] = set()
+        phrases: list[str] = []
+        for phrase in candidates:
+            normalized = " ".join(phrase.lower().split())
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                phrases.append(normalized)
+        return phrases
+
+    def _match_handoff_route(self, text: str) -> tuple[dict[str, Any] | None, str | None]:
+        """Return the configured handoff route and matched start-anchored phrase."""
+        for route in self._discord_handoff_routes():
+            phrases = self._normalize_handoff_trigger_phrases(route.get("trigger_phrases"))
+            matched = self._match_deep_work_trigger(text, phrases)
+            if matched:
+                return route, matched
+        return None, None
+
+    @staticmethod
+    def _match_deep_work_trigger(text: str, phrases: list[str]) -> str | None:
+        """Return the start-anchored Deep Work trigger phrase, if present."""
+        if not text:
+            return None
+        normalized = " ".join(text.strip().lower().split())
+        for phrase in phrases:
+            if not phrase:
+                continue
+            if normalized == phrase:
+                return phrase
+            if normalized.startswith(f"{phrase} ") or normalized.startswith(f"{phrase}:"):
+                return phrase
+        return None
+
     @staticmethod
     def _strip_deep_work_trigger(text: str, trigger: str) -> str:
-        """Remove one trigger phrase occurrence from text and return cleaned text."""
+        """Remove a start-anchored trigger phrase from text and return cleaned text."""
         if not text:
             return ""
-        lowered = text.lower()
-        idx = lowered.find(trigger)
-        if idx < 0:
-            return text.strip()
-        cleaned = (text[:idx] + text[idx + len(trigger):]).strip()
+        pattern = re.compile(rf"^\s*{re.escape(trigger)}\b", re.IGNORECASE)
+        cleaned = pattern.sub("", text, count=1).strip()
         cleaned = cleaned.lstrip("-:;,. ").rstrip()
         return cleaned
 
@@ -4592,42 +4703,61 @@ class DiscordAdapter(BasePlatformAdapter):
             normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
             message.content = normalized_content
 
-        # Deep Work phrase-triggered handoff: route this turn into a new thread
-        # under the configured Deep Work parent channel, even if the source
-        # channel would normally require @mention.  Bot-authored
-        # [AUTO_RUN_DEEP_WORK] transport messages force the same handoff path so
-        # an auto-run cannot execute in the source/quick-work channel.
-        auto_run_marker = "[AUTO_RUN_DEEP_WORK]"
-        auto_run_deep_work = auto_run_marker in normalized_content
-        if auto_run_deep_work:
-            normalized_content = normalized_content.replace(auto_run_marker, "", 1).strip()
-            normalized_content = normalized_content.lstrip("-:;,. ").rstrip()
-            message.content = normalized_content
+        # Configured phrase-triggered handoff: route this turn into a new thread
+        # under the route target channel. The target channel's model binding then
+        # applies to the created thread through parent-channel inheritance.
+        handoff_route = None
+        auto_run_marker = None
+        auto_run_handoff = False
+        for route in self._discord_handoff_routes():
+            marker = str(route.get("auto_run_marker") or "").strip()
+            if marker and marker in normalized_content:
+                handoff_route = route
+                auto_run_marker = marker
+                auto_run_handoff = True
+                normalized_content = normalized_content.replace(marker, "", 1).strip()
+                normalized_content = normalized_content.lstrip("-:;,. ").rstrip()
+                message.content = normalized_content
+                break
 
-        normalized_lower = " ".join(normalized_content.lower().split())
-        matched_trigger = auto_run_marker if auto_run_deep_work else None
-        if matched_trigger is None:
-            for phrase in self._discord_deep_work_trigger_phrases():
-                if phrase and phrase in normalized_lower:
-                    matched_trigger = phrase
-                    break
+        matched_trigger = auto_run_marker if auto_run_handoff else None
+        if handoff_route is None:
+            handoff_route, matched_trigger = self._match_handoff_route(normalized_content)
 
-        if matched_trigger:
-            deep_parent_id = self._discord_deep_work_channel_id()
-            if deep_parent_id:
-                source_channel_id = str(getattr(message.channel, "id", ""))
+        if handoff_route and matched_trigger:
+            route_label = str(handoff_route.get("label") or handoff_route.get("name") or "Handoff").strip() or "Handoff"
+            target_parent_id = str(handoff_route.get("target_channel_id") or "").strip()
+            source_channel_id = str(getattr(message.channel, "id", ""))
+            in_target_channel = bool(
+                target_parent_id
+                and (
+                    source_channel_id == target_parent_id
+                    or (parent_channel_id and str(parent_channel_id) == target_parent_id)
+                )
+            )
+            if in_target_channel and not auto_run_handoff:
+                logger.info(
+                    "[%s] Ignoring recursive %s handoff trigger in target channel/thread: source=%s parent=%s",
+                    self.name,
+                    route_label,
+                    source_channel_id,
+                    parent_channel_id,
+                )
+                matched_trigger = None
+            elif target_parent_id:
                 source_thread_id = thread_id
                 source_msg_id = str(getattr(message, "id", ""))
                 user_name = getattr(message.author, "display_name", None) or getattr(message.author, "name", "user")
 
                 task_text = self._strip_deep_work_trigger(normalized_content, matched_trigger)
                 if not task_text:
-                    task_text = "Continue this task in Deep Work. Ask one clarification question if needed and proceed."
+                    task_text = f"Continue this task in {route_label}. Ask one clarification question if needed and proceed."
 
-                thread_name_seed = task_text[:56].strip() or "deep-work-handoff"
-                thread_name = f"Deep Work — {thread_name_seed}"[:80]
+                thread_name_prefix = str(handoff_route.get("thread_name_prefix") or route_label).strip() or "Handoff"
+                thread_name_seed = task_text[:56].strip() or "handoff"
+                thread_name = f"{thread_name_prefix} — {thread_name_seed}"[:80]
 
-                routed_thread_id = await self.create_handoff_thread(deep_parent_id, thread_name)
+                routed_thread_id = await self.create_handoff_thread(target_parent_id, thread_name)
                 if routed_thread_id and self._client is not None:
                     routed_channel = self._client.get_channel(int(routed_thread_id))
                     if routed_channel is None:
@@ -4637,11 +4767,11 @@ class DiscordAdapter(BasePlatformAdapter):
                         mention_prefix = True
                         is_thread = True
                         thread_id = str(routed_channel.id)
-                        parent_channel_id = str(deep_parent_id)
+                        parent_channel_id = str(target_parent_id)
                         self._threads.mark(thread_id)
 
                         normalized_content = (
-                            f"[Deep Work handoff from channel {source_channel_id}"
+                            f"[{route_label} handoff from channel {source_channel_id}"
                             f" thread {source_thread_id or 'none'}"
                             f" message {source_msg_id}"
                             f" by {user_name}]\n"
@@ -4649,17 +4779,19 @@ class DiscordAdapter(BasePlatformAdapter):
                         )
                         message.content = normalized_content
                         logger.info(
-                            "[%s] Deep Work handoff trigger matched ('%s'): source=%s -> deep_parent=%s thread=%s",
+                            "[%s] %s handoff trigger matched ('%s'): source=%s -> target_parent=%s thread=%s",
                             self.name,
+                            route_label,
                             matched_trigger,
                             source_channel_id,
-                            deep_parent_id,
+                            target_parent_id,
                             thread_id,
                         )
             else:
                 logger.warning(
-                    "[%s] Deep Work trigger matched but no deep_work_channel_id configured",
+                    "[%s] %s handoff trigger matched but no target_channel_id configured",
                     self.name,
+                    route_label,
                 )
 
         if not isinstance(message.channel, discord.DMChannel):

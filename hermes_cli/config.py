@@ -1699,7 +1699,8 @@ DEFAULT_CONFIG = {
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
         "channel_prompts": {},         # Per-channel ephemeral system prompts (forum parents apply to child threads)
         "channel_model_bindings": [],  # Per-channel default model/provider bindings (threads inherit parent unless explicitly pinned)
-        # Deep Work handoff routing: when a message contains one of
+        "handoff_routes": [],          # Explicit Discord channel-to-channel handoff routes; target channel bindings supply runtime/model
+        # Deep Work handoff routing: legacy shortcut. Prefer handoff_routes for
         # deep_work_trigger_phrases, route that turn to a newly created thread
         # under deep_work_channel_id and continue there.
         "deep_work_channel_id": "",
