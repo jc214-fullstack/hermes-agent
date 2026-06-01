@@ -1,18 +1,108 @@
-# System B Media Analysis Pipeline
+# instagram-reel-analyzer
 
-This is the Hermes-owned media analysis pipeline for Discord source intake, extraction, durable source indexing, and thread naming.
+System B media backend for turning supported online media URLs into local files and analysis-ready artifacts.
 
-It is not an Instagram-only project. The dedicated project repository remains `instagram-reel-analyzer` for continuity, even though that name is legacy from the first prototype. This folder is the Hermes repo mirror/subfolder for the same project so System B stays attached to the Hermes system.
+The original PowerShell scripts are still kept as prior art for Instagram reels. The default runtime path is now native Linux/WSL Python so Hermes can call it directly.
 
-Canonical identity: **System B Media Analysis Pipeline** / **Hermes Media Analysis Pipeline**.
+## What this does
 
-Runtime surfaces:
-- Live hooks: `/home/imagi/.hermes/hooks/media-analysis-intake` and `/home/imagi/.hermes/hooks/media-analysis-z-backend`
-- Live helper library: `/home/imagi/media-analysis/lib`
-- Durable source index: `/home/imagi/media-analysis/index/sources.jsonl`
-- Per-thread workspaces: `/home/imagi/media-analysis/threads/<thread_id>/`
+`media-dl` performs the pre-analysis media preparation stage:
 
-This repo package preserves the Hermes-specific hook bundle and reapply surface so the system can survive Hermes upgrades and repo cleanup without depending on the old Instagram-named project.
+1. identifies the URL source
+2. downloads the media with `yt-dlp`
+3. saves `yt-dlp` metadata via `*.info.json`
+4. extracts mono 16 kHz `audio.wav` with `ffmpeg`
+5. samples visual frames with `ffmpeg`
+6. writes `manifest.json` for Hermes/System B to consume
 
-Dedicated project repo: `jc214-fullstack/instagram-reel-analyzer`
-Hermes mirror path: `integrations/system-b-media-analysis/`
+Supported source labels:
+
+- `instagram`
+- `tiktok`
+- `youtube`
+- `twitter`
+- `facebook`
+- `reddit`
+- `vimeo`
+- `loom`
+- `direct`
+- `unknown`
+
+Unknown sources are still attempted through `yt-dlp`; the label is for routing, metrics, and later fallbacks.
+
+## Usage
+
+```bash
+python -m media_backend.cli "https://www.instagram.com/reel/REEL_ID/" /tmp/system-b-job
+```
+
+Optional flags:
+
+```bash
+python -m media_backend.cli URL OUT_DIR --frame-interval 5
+python -m media_backend.cli URL OUT_DIR --skip-audio
+python -m media_backend.cli URL OUT_DIR --skip-frames
+```
+
+On success, stdout is the path to `manifest.json`. Operational status goes to stderr.
+
+## Output shape
+
+```text
+OUT_DIR/
+  <downloaded-video-file>
+  <downloaded-video-file>.info.json
+  manifest.json
+  <video-stem>-analysis/
+    audio.wav
+    frames/
+      frame-001.jpg
+      frame-002.jpg
+```
+
+`manifest.json` includes source label, local artifact paths, frame count, selected platform metadata, and nonfatal extraction errors.
+
+## System B architecture role
+
+Hermes media-analysis intake should create/dedup the Discord workspace first, then call this backend for each URL. This repo should own URL-source download and local artifact preparation. Hermes/System B should own summarization, transcript/vision model calls, thread replies, and Kanban escalation.
+
+The intended flow is:
+
+Discord URL → Hermes intake/dedup → this backend downloads/extracts → System B analyzes local artifacts.
+
+## Current status
+
+Working:
+
+- source detection
+- `yt-dlp` download wrapper
+- metadata JSON capture
+- `ffmpeg` audio extraction
+- `ffmpeg` frame sampling
+- manifest writer
+- mocked unit tests
+
+Still intentionally separate / future work:
+
+- durable transcript backend selection
+- VLM/video-model analysis backend selection
+- auth-gated/private source handling
+- direct integration from Hermes hook into this CLI
+
+## Main files
+
+- `media_backend/` — native Python System B backend
+- `tests/` — mocked tests for detector/downloader/extractor/manifest/CLI
+- `SKILL.md` — OpenClaw/Hermes operating guide
+- `scripts/download_reel.ps1` — legacy PowerShell Instagram download script
+- `scripts/extract_media.ps1` — legacy PowerShell extraction script
+- `scripts/test_pipeline.ps1` — legacy PowerShell test wrapper
+- `references/pipeline.md`
+- `references/transcript-status.md`
+
+## Repository role
+
+This repository remains the dedicated project workspace for **System B Media Analysis Pipeline** development and tests. The historical repository name, `instagram-reel-analyzer`, is legacy from the first prototype; the project now covers mixed media source intake and analysis, not Instagram only.
+
+Hermes integration snapshots are also mirrored into the Hermes GitHub fork under `integrations/system-b-media-analysis/` so the pipeline stays attached to the Hermes system while this repo remains the focused project workspace.
+

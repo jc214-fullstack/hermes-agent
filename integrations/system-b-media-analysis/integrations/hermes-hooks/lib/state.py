@@ -78,6 +78,10 @@ def upsert_source_record(
     canonical_name: str = "",
     thread_title: str = "",
     metadata: dict | None = None,
+    source_storage: dict | None = None,
+    manifest_path: str = "",
+    status: str = "extracted",
+    error: str = "",
 ) -> None:
     """Insert or update the durable source index record for an analyzed source.
 
@@ -114,11 +118,20 @@ def upsert_source_record(
         "first_analyzed_at": now,
         "latest_reused_at": None,
     }
+    thread_ids = list(record.get("thread_ids") or [])
+    if thread_id and thread_id not in thread_ids:
+        thread_ids.append(thread_id)
+    prior_run_count = int(record.get("run_count") or 0)
+    source_storage = source_storage or {}
     record.update({
         "normalized_url": normalized_url,
         "url": raw_url,
         "thread_id": thread_id,
         "workspace_path": workspace_path,
+        "latest_thread_id": thread_id,
+        "latest_workspace_path": workspace_path,
+        "thread_ids": thread_ids,
+        "run_count": prior_run_count + 1,
         "source_type": source_type,
         "title": title,
         "confidence": confidence,
@@ -126,8 +139,21 @@ def upsert_source_record(
         "creator": creator,
         "canonical_name": canonical_name or title or thread_title,
         "thread_title": thread_title,
+        "status": status,
+        "latest_manifest_path": manifest_path,
         "updated_at": now,
     })
+    if error:
+        record["error"] = error
+    if source_storage:
+        record.update({
+            "source_key": source_storage.get("source_key") or record.get("source_key"),
+            "source_dir": source_storage.get("source_dir") or record.get("source_dir"),
+            "storage_class": source_storage.get("storage_class") or record.get("storage_class"),
+            "source_platform": source_storage.get("platform") or record.get("source_platform"),
+            "company": source_storage.get("company"),
+            "raw_kind": source_storage.get("raw_kind"),
+        })
     if metadata:
         record["metadata"] = metadata
 

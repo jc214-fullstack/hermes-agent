@@ -24,9 +24,13 @@ WORKSPACE_ROOT = Path("/home/imagi/media-analysis/threads")
 TIMEOUT_SECONDS = int(os.environ.get("SYSTEM_B_BACKEND_TIMEOUT", "300"))
 FRAME_INTERVAL_SECONDS = int(os.environ.get("SYSTEM_B_FRAME_INTERVAL", "2"))
 
-_LIB = Path("/home/imagi/media-analysis/lib")
-if str(_LIB) not in sys.path:
-    sys.path.insert(0, str(_LIB))
+_LOCAL_LIB = Path(__file__).resolve().parents[1] / "lib"
+_LIVE_LIB = Path("/home/imagi/media-analysis/lib")
+for _LIB in (_LIVE_LIB, _LOCAL_LIB):
+    if _LIB.exists():
+        if str(_LIB) in sys.path:
+            sys.path.remove(str(_LIB))
+        sys.path.insert(0, str(_LIB))
 
 from url_norm import extract_urls, normalize_url  # type: ignore[import]
 from state import ensure_workspace, read_state, upsert_source_record, write_state  # type: ignore[import]
@@ -183,6 +187,12 @@ def _copy_manifest_artifacts(job: dict[str, Any], manifest: dict[str, Any], mani
     return artifacts
 
 
+def _adapter_label(manifest: dict[str, Any]) -> str:
+    metadata = manifest.get("metadata") or {}
+    decision = metadata.get("adapter_decision") or {}
+    return str(decision.get("primary") or manifest.get("acquisition_method") or "_unknown_")
+
+
 def _write_source_doc(thread_id: str, state: dict[str, Any]) -> None:
     workspace = ensure_workspace(thread_id)
     lines: list[str] = ["# Source Metadata", ""]
@@ -206,6 +216,7 @@ def _write_source_doc(thread_id: str, state: dict[str, Any]) -> None:
             f"- Normalized URL: {job.get('normalized_url', '')}",
             f"- Source type: {job.get('source_type', 'unknown')}",
             f"- Status: {job.get('status', '')}",
+            f"- Adapter: {_adapter_label(manifest)}",
             f"- Title: {metadata.get('title') or '_unknown_'}",
             f"- Creator/uploader: {metadata.get('uploader') or '_unknown_'}",
             f"- Platform ID: {metadata.get('id') or '_unknown_'}",
@@ -222,13 +233,57 @@ def _write_source_doc(thread_id: str, state: dict[str, Any]) -> None:
             f"- Transcript: {artifacts.get('transcript') or '_missing_'}",
             f"- Transcript status: {job.get('transcript_status') or '_unknown_'} ({job.get('transcript_method') or '_unknown_'})",
             f"- Frame count: {len(artifacts.get('frames') or [])}",
+            f"- Source storage: {(job.get('source_storage') or {}).get('source_dir') or '_missing_'}",
             "",
         ])
+        if state.get("diagnostics_requested"):
+            lines.extend(["### Diagnostics", "", "- Diagnostics: 04-diagnostics.md", ""])
         if job.get("error"):
             lines.extend(["### Error", "", str(job.get("error")), ""])
         if metadata.get("description"):
             lines.extend(["### Description/caption", "", str(metadata.get("description")), ""])
     (workspace / "01-source.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def _write_diagnostics_doc(thread_id: str, state: dict[str, Any]) -> None:
+    workspace = ensure_workspace(thread_id)
+    lines: list[str] = ["# System B Diagnostics", ""]
+    lines.extend([
+        f"- Thread: {thread_id}",
+        f"- Diagnostics requested: {bool(state.get('diagnostics_requested'))}",
+        f"- Trigger: {state.get('diagnostics_trigger') or '_none_'}",
+        f"- Stage: {state.get('stage') or '_unknown_'}",
+        "",
+    ])
+    for idx, job in enumerate(state.get("jobs", []), start=1):
+        manifest = job.get("backend_manifest") or {}
+        metadata = manifest.get("metadata") or {}
+        artifacts = job.get("artifacts") or {}
+        source_storage = job.get("source_storage") or manifest.get("source_storage") or {}
+        lines.extend([
+            f"## Source {idx}",
+            "",
+            f"- URL: {job.get('url') or '_missing_'}",
+            f"- Status: {job.get('status') or '_unknown_'}",
+            f"- Adapter: {_adapter_label(manifest)}",
+            f"- Fallback warnings: {metadata.get('adapter_warnings') or []}",
+            f"- Source storage: {source_storage.get('source_dir') or '_missing_'}",
+            f"- Downloaded files: {len(manifest.get('media_paths') or [])}",
+            f"- Manifest: {artifacts.get('backend_manifest') or '_missing_'}",
+            f"- Media kind: {manifest.get('media_kind') or '_unknown_'}",
+            f"- Transcript: {job.get('transcript_status') or manifest.get('transcript_status') or '_unknown_'}",
+            f"- Frames: {len(artifacts.get('frames') or manifest.get('frames') or [])}",
+            f"- Source index: {job.get('source_index_status') or '_unknown_'}",
+            f"- Discord rename: {(job.get('thread_rename') or state.get('thread_rename') or {}).get('ok', '_unknown_')}",
+            f"- Backend exit code: {job.get('backend_exit_code', '_unknown_')}",
+            f"- Errors: {job.get('error') or manifest.get('errors') or []}",
+            "",
+        ])
+        if job.get("backend_stderr"):
+            lines.extend(["### Backend stderr", "", "```text", str(job.get("backend_stderr"))[-2000:], "```", ""])
+        if job.get("error"):
+            lines.extend(["Next action: inspect adapter stderr and retry with the fallback adapter if one is listed.", ""])
+    (workspace / "04-diagnostics.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def _ensure_state(thread_id: str, context: dict[str, Any], urls: list[str]) -> dict[str, Any]:
@@ -320,6 +375,8 @@ async def handle(event_type: str, context: dict[str, Any]) -> None:
             else:
                 job["backend_manifest"] = manifest
                 job["source_type"] = manifest.get("source") or job.get("source_type") or "unknown"
+                if manifest.get("source_storage"):
+                    job["source_storage"] = manifest.get("source_storage")
                 artifacts = _copy_manifest_artifacts(job, manifest, manifest_path)
                 if manifest.get("transcript_status"):
                     job["transcript_status"] = manifest.get("transcript_status")
@@ -366,8 +423,16 @@ async def handle(event_type: str, context: dict[str, Any]) -> None:
                         "webpage_url": metadata.get("webpage_url"),
                         "media_kind": manifest.get("media_kind"),
                         "acquisition_method": manifest.get("acquisition_method"),
+                        "adapter_decision": metadata.get("adapter_decision"),
+                        "adapter_warnings": metadata.get("adapter_warnings", []),
+                        "transcript_status": manifest.get("transcript_status"),
+                        "frame_count": manifest.get("frame_count") if manifest.get("frame_count") is not None else len(manifest.get("frames") or []),
                     },
+                    source_storage=manifest.get("source_storage") or {},
+                    manifest_path=str(manifest_path),
+                    status=job["status"],
                 )
+                job["source_index_status"] = "upserted"
                 rename_result = _rename_discord_thread(thread_id, suggested_title)
                 state["thread_rename"] = rename_result
                 job["thread_rename"] = rename_result
@@ -389,4 +454,6 @@ async def handle(event_type: str, context: dict[str, Any]) -> None:
             state["stage"] = "extract_complete"
         write_state(thread_id, state)
         _write_source_doc(thread_id, state)
+        if state.get("diagnostics_requested"):
+            _write_diagnostics_doc(thread_id, state)
         print(f"[media-analysis-z-backend] thread={thread_id} statuses={statuses}", flush=True)

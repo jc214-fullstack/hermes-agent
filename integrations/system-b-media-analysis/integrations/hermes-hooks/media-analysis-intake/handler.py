@@ -18,10 +18,15 @@ import sys
 import time
 from pathlib import Path
 
-# Allow imports from the media-analysis lib directory
-_LIB = Path("/home/imagi/media-analysis/lib")
-if str(_LIB) not in sys.path:
-    sys.path.insert(0, str(_LIB))
+# Allow imports from the repo-local hook lib during tests/mirrors, falling back to
+# the live media-analysis lib in the installed Hermes runtime.
+_LOCAL_LIB = Path(__file__).resolve().parents[1] / "lib"
+_LIVE_LIB = Path("/home/imagi/media-analysis/lib")
+for _LIB in (_LIVE_LIB, _LOCAL_LIB):
+    if _LIB.exists():
+        if str(_LIB) in sys.path:
+            sys.path.remove(str(_LIB))
+        sys.path.insert(0, str(_LIB))
 
 from url_norm import extract_urls, normalize_url  # type: ignore[import]
 from state import (  # type: ignore[import]
@@ -44,6 +49,15 @@ def _is_media_analysis_event(context: dict) -> bool:
     return chat_id == MEDIA_ANALYSIS_CHANNEL or parent_chat_id == MEDIA_ANALYSIS_CHANNEL
 
 
+def _diagnostics_trigger(message: str) -> str:
+    lowered = str(message or "").lower().strip()
+    if "#systemb-test" in lowered:
+        return "#systemb-test"
+    if lowered.startswith("test system b:"):
+        return "test system b:"
+    return ""
+
+
 async def handle(event_type: str, context: dict) -> None:
     """Pre-create System B workspace when a URL lands in the media-analysis channel."""
     if not _is_media_analysis_event(context):
@@ -53,6 +67,7 @@ async def handle(event_type: str, context: dict) -> None:
     urls = extract_urls(message)
     if not urls:
         return
+    diagnostics_trigger = _diagnostics_trigger(message)
 
     chat_id = context.get("chat_id", "")
     parent_chat_id = context.get("parent_chat_id", "")
@@ -93,6 +108,10 @@ async def handle(event_type: str, context: dict) -> None:
         state["thread_title_base"] = "video by whoever"
         state["thread_title_suggestion"] = "video by whoever"
         state["thread_title_source"] = "intake_default"
+        if diagnostics_trigger:
+            state["test_run"] = True
+            state["diagnostics_requested"] = True
+            state["diagnostics_trigger"] = diagnostics_trigger
         from state import write_state  # type: ignore[import]
         write_state(thread_id, state)
         write_request_doc(
