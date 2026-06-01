@@ -1,0 +1,8 @@
+name: media-analysis-intake
+description: >
+  Pre-creates the System B analysis workspace and dedup state before the agent
+  runs in the Discord media-analysis channel (1509517024345194617). Fires only
+  when the incoming message contains at least one URL. Skips bot messages and
+  channels outside the media-analysis lane.
+events:
+  - agent:start

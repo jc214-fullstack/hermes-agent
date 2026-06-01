@@ -1,0 +1,8 @@
+name: media-analysis-z-backend
+description: >
+  Runs after media-analysis-intake for Discord media-analysis URL jobs. Calls the
+  System B media backend to download source media, extract audio/frames, and
+  write manifest-backed artifacts into the thread workspace before the agent
+  starts analysis.
+events:
+  - agent:start
