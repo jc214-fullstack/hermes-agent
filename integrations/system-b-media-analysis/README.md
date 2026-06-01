@@ -2,7 +2,7 @@
 
 This is the Hermes-owned media analysis pipeline for Discord source intake, extraction, durable source indexing, and thread naming.
 
-It is not an Instagram-only project. The old `instagram-reel-analyzer` repository name came from the original prototype and is now treated as a legacy staging name, not the canonical system identity.
+It is not an Instagram-only project. The dedicated project repository remains `instagram-reel-analyzer` for continuity, even though that name is legacy from the first prototype. This folder is the Hermes repo mirror/subfolder for the same project so System B stays attached to the Hermes system.
 
 Canonical identity: **System B Media Analysis Pipeline** / **Hermes Media Analysis Pipeline**.
 
@@ -13,3 +13,6 @@ Runtime surfaces:
 - Per-thread workspaces: `/home/imagi/media-analysis/threads/<thread_id>/`
 
 This repo package preserves the Hermes-specific hook bundle and reapply surface so the system can survive Hermes upgrades and repo cleanup without depending on the old Instagram-named project.
+
+Dedicated project repo: `jc214-fullstack/instagram-reel-analyzer`
+Hermes mirror path: `integrations/system-b-media-analysis/`
