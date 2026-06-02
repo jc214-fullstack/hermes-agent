@@ -56,11 +56,12 @@ class FakeDMChannel:
 
 
 class FakeTextChannel:
-    def __init__(self, channel_id: int = 1, name: str = "general", guild_name: str = "Hermes Server"):
+    def __init__(self, channel_id: int = 1, name: str = "general", guild_name: str = "Hermes Server", category_id: int | None = None):
         self.id = channel_id
         self.name = name
         self.guild = SimpleNamespace(name=guild_name)
         self.topic = None
+        self.category_id = category_id
 
     def history(self, *, limit, before, after=None, oldest_first=None):
         async def _iter():
@@ -70,12 +71,13 @@ class FakeTextChannel:
 
 
 class FakeForumChannel:
-    def __init__(self, channel_id: int = 1, name: str = "support-forum", guild_name: str = "Hermes Server"):
+    def __init__(self, channel_id: int = 1, name: str = "support-forum", guild_name: str = "Hermes Server", category_id: int | None = None):
         self.id = channel_id
         self.name = name
         self.guild = SimpleNamespace(name=guild_name)
         self.type = 15
         self.topic = None
+        self.category_id = category_id
 
 
 class FakeThread:
@@ -208,6 +210,26 @@ async def test_discord_free_response_in_server_channels(adapter, monkeypatch):
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "hello from channel"
+    assert event.source.chat_id == "123"
+    assert event.source.chat_type == "group"
+
+
+@pytest.mark.asyncio
+async def test_discord_free_response_matches_parent_category_id(adapter, monkeypatch):
+    """Category IDs in free_response_channels should exempt child text channels from mention gating."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "555")
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=123, category_id=555),
+        content="hello from category child",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "hello from category child"
     assert event.source.chat_id == "123"
     assert event.source.chat_type == "group"
 
@@ -575,6 +597,31 @@ async def test_discord_free_response_auto_thread_channel_creates_thread(adapter,
     assert event.source.chat_id == "790"
     assert event.source.parent_chat_id == "789"
 
+
+@pytest.mark.asyncio
+async def test_discord_free_response_auto_thread_category_creates_thread(adapter, monkeypatch):
+    """Category IDs should work for free-response auto-thread routing too."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "900")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_AUTO_THREAD_CHANNELS", "900")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)  # default true
+
+    fake_thread = FakeThread(channel_id=790, name="auto-thread")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=789, category_id=900),
+        content="media url without mention",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+    assert event.source.chat_id == "790"
+    assert event.source.parent_chat_id == "789"
 
 
 @pytest.mark.asyncio
@@ -1032,8 +1079,8 @@ async def test_auto_run_deep_work_marker_forces_deep_work_thread(adapter, monkey
 
 
 @pytest.mark.asyncio
-async def test_deep_work_trigger_must_be_start_anchored(adapter, monkeypatch):
-    """Mentioning the trigger phrase in explanatory text must not create a handoff."""
+async def test_deep_work_trigger_in_quotes_does_not_create_handoff(adapter, monkeypatch):
+    """Quoted explanatory mentions must not be treated as handoff commands."""
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
 
     adapter.config.extra["deep_work_channel_id"] = "1510042356487950376"
@@ -1054,6 +1101,67 @@ async def test_deep_work_trigger_must_be_start_anchored(adapter, monkeypatch):
     event = adapter.handle_message.await_args.args[0]
     assert event.source.chat_id == "123"
     assert event.source.chat_type == "group"
+
+
+@pytest.mark.asyncio
+async def test_deep_work_trigger_after_comma_creates_handoff(adapter, monkeypatch):
+    """Inline command after punctuation should still create the Deep Work handoff thread."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+
+    deep_parent = "1510042356487950376"
+    deep_parent_channel = FakeTextChannel(channel_id=int(deep_parent), name="deep-work")
+    deep_thread = FakeThread(channel_id=9003, name="Deep Work — backend design", parent=deep_parent_channel)
+
+    adapter.config.extra["deep_work_channel_id"] = deep_parent
+    adapter.config.extra["deep_work_trigger_phrases"] = ["push this to deep work"]
+    adapter.create_handoff_thread = AsyncMock(return_value=str(deep_thread.id))
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_channel=lambda cid: deep_thread if int(cid) == deep_thread.id else None,
+        fetch_channel=AsyncMock(return_value=deep_thread),
+    )
+
+    source_channel = FakeTextChannel(channel_id=321, name="quick-work")
+    message = make_message(
+        channel=source_channel,
+        content="I just want to understand the compliance work in this chat, push this to deep work: backend design only",
+        mentions=[],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.create_handoff_thread.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == str(deep_thread.id)
+    assert event.source.thread_id == str(deep_thread.id)
+    assert event.source.parent_chat_id == deep_parent
+    assert "Deep Work handoff from channel 321" in event.text
+    assert "backend design only" in event.text
+
+
+@pytest.mark.asyncio
+async def test_deep_work_handoff_failure_does_not_fall_back_to_source_channel(adapter, monkeypatch):
+    """If Deep Work thread creation fails, the message must not execute in the source channel."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+
+    deep_parent = "1510042356487950376"
+    adapter.config.extra["deep_work_channel_id"] = deep_parent
+    adapter.config.extra["deep_work_trigger_phrases"] = ["push this to deep work"]
+    adapter.create_handoff_thread = AsyncMock(return_value=None)
+    adapter._client = SimpleNamespace(user=SimpleNamespace(id=999), get_channel=lambda cid: None, fetch_channel=AsyncMock())
+
+    source_channel = FakeTextChannel(channel_id=123, name="quick-work")
+    message = make_message(
+        channel=source_channel,
+        content="push this to deep work: backend work must stay threaded",
+        mentions=[],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.create_handoff_thread.assert_awaited_once()
+    adapter.handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

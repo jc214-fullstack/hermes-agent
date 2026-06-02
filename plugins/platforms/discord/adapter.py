@@ -858,14 +858,11 @@ class DiscordAdapter(BasePlatformAdapter):
                         "DISCORD_IGNORE_NO_MENTION", "true"
                     ).lower() in {"true", "1", "yes"}
                     if _ignore_no_mention and not _self_mentioned and not _other_bots_mentioned:
-                        _channel_id = str(message.channel.id)
-                        _parent_id = None
-                        if hasattr(message.channel, "parent_id") and message.channel.parent_id:
-                            _parent_id = str(message.channel.parent_id)
                         _free_channels = adapter_self._discord_free_response_channels()
-                        _channel_ids = {_channel_id}
-                        if _parent_id:
-                            _channel_ids.add(_parent_id)
+                        _channel_ids = adapter_self._get_channel_scope_ids(
+                            message.channel,
+                            adapter_self._get_parent_channel_id(message.channel),
+                        )
                         if "*" not in _free_channels and not (_channel_ids & _free_channels):
                             return
 
@@ -2381,15 +2378,12 @@ class DiscordAdapter(BasePlatformAdapter):
             chan_id_raw = getattr(interaction, "channel_id", None) or getattr(
                 chan_obj, "id", None,
             )
-            channel_ids: set = set()
+            channel_ids: set[str] = set()
             if chan_id_raw is not None:
                 channel_ids.add(str(chan_id_raw))
-                # Mirror on_message: also test the parent channel for threads
-                # so per-channel allow/deny lists work consistently.
-                if isinstance(chan_obj, discord.Thread):
-                    parent_id = self._get_parent_channel_id(chan_obj)
-                    if parent_id:
-                        channel_ids.add(str(parent_id))
+            if chan_obj is not None:
+                parent_id = self._get_parent_channel_id(chan_obj)
+                channel_ids = self._get_channel_scope_ids(chan_obj, parent_id) or channel_ids
 
             allowed_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "")
             if allowed_raw:
@@ -3902,26 +3896,67 @@ class DiscordAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _match_deep_work_trigger(text: str, phrases: list[str]) -> str | None:
-        """Return the start-anchored Deep Work trigger phrase, if present."""
+        """Return a command-like Deep Work trigger phrase, if present.
+
+        Supports both strict start-anchored commands and inline commands after
+        punctuation (e.g. "..., push this to deep work: ...") while avoiding
+        quoted explanatory mentions like: When I say "push this to deep work".
+        """
         if not text:
             return None
         normalized = " ".join(text.strip().lower().split())
         for phrase in phrases:
             if not phrase:
                 continue
+            # Fast path: exact/start-anchored command forms.
             if normalized == phrase:
                 return phrase
             if normalized.startswith(f"{phrase} ") or normalized.startswith(f"{phrase}:"):
                 return phrase
+
+            # Inline command: must be preceded by whitespace/punctuation/newline,
+            # not an opening quote, and followed by punctuation/space/end.
+            pattern = re.compile(
+                rf"(^|[\s,;:\-\(\[]){re.escape(phrase)}(?=$|[\s,;:\-.!\?\)])",
+                re.IGNORECASE,
+            )
+            match = pattern.search(normalized)
+            if not match:
+                continue
+            start = match.start(0)
+            end = match.end(0)
+            before = normalized[start - 1] if start > 0 else ""
+            after = normalized[end] if end < len(normalized) else ""
+            if before in {'"', "'"} or after in {'"', "'"}:
+                continue
+            return phrase
         return None
 
     @staticmethod
     def _strip_deep_work_trigger(text: str, trigger: str) -> str:
-        """Remove a start-anchored trigger phrase from text and return cleaned text."""
+        """Remove trigger phrase from text and return command payload.
+
+        If the trigger appears inline after punctuation, keep the text after the
+        trigger (and drop prefatory text before it).
+        """
         if not text:
             return ""
-        pattern = re.compile(rf"^\s*{re.escape(trigger)}\b", re.IGNORECASE)
-        cleaned = pattern.sub("", text, count=1).strip()
+
+        start_pattern = re.compile(rf"^\s*{re.escape(trigger)}\b", re.IGNORECASE)
+        if start_pattern.search(text):
+            cleaned = start_pattern.sub("", text, count=1).strip()
+            cleaned = cleaned.lstrip("-:;,. ").rstrip()
+            return cleaned
+
+        inline_pattern = re.compile(
+            rf"(?:^|[\s,;:\-\(\[]){re.escape(trigger)}\b",
+            re.IGNORECASE,
+        )
+        match = inline_pattern.search(text)
+        if not match:
+            return text.strip()
+
+        cleaned = text[match.end():].strip()
         cleaned = cleaned.lstrip("-:;,. ").rstrip()
         return cleaned
 
@@ -4507,6 +4542,35 @@ class DiscordAdapter(BasePlatformAdapter):
             return str(parent_id)
         return None
 
+    def _get_category_id(self, channel: Any) -> Optional[str]:
+        """Return the Discord category ID for a channel or thread, if present."""
+        category_id = getattr(channel, "category_id", None)
+        if category_id is not None:
+            return str(category_id)
+        parent = getattr(channel, "parent", None)
+        if parent is not None:
+            parent_category_id = getattr(parent, "category_id", None)
+            if parent_category_id is not None:
+                return str(parent_category_id)
+        return None
+
+    def _get_channel_scope_ids(self, channel: Any, parent_channel_id: Optional[str] = None) -> set[str]:
+        """Return routing IDs that should match this Discord message.
+
+        Includes the concrete channel ID, its parent channel ID for threads, and
+        the enclosing category ID when present. This lets config lists like
+        ``free_response_channels`` or ``ignored_channels`` accept either a
+        specific channel/thread parent or the category container that owns the
+        channel.
+        """
+        channel_ids = {str(channel.id)}
+        if parent_channel_id:
+            channel_ids.add(parent_channel_id)
+        category_id = self._get_category_id(channel)
+        if category_id:
+            channel_ids.add(category_id)
+        return channel_ids
+
     def _is_forum_parent(self, channel: Any) -> bool:
         """Best-effort check for whether a Discord channel is a forum channel."""
         if channel is None:
@@ -4775,35 +4839,54 @@ class DiscordAdapter(BasePlatformAdapter):
                 thread_name = f"{thread_name_prefix} — {thread_name_seed}"[:80]
 
                 routed_thread_id = await self.create_handoff_thread(target_parent_id, thread_name)
-                if routed_thread_id and self._client is not None:
-                    routed_channel = self._client.get_channel(int(routed_thread_id))
-                    if routed_channel is None:
-                        routed_channel = await self._client.fetch_channel(int(routed_thread_id))
-                    if routed_channel is not None:
-                        auto_threaded_channel = routed_channel
-                        mention_prefix = True
-                        is_thread = True
-                        thread_id = str(routed_channel.id)
-                        parent_channel_id = str(target_parent_id)
-                        self._threads.mark(thread_id)
+                if not routed_thread_id or self._client is None:
+                    logger.warning(
+                        "[%s] %s handoff trigger matched but thread creation failed; dropping source-channel fallback: source=%s target_parent=%s",
+                        self.name,
+                        route_label,
+                        source_channel_id,
+                        target_parent_id,
+                    )
+                    return
 
-                        normalized_content = (
-                            f"[{route_label} handoff from channel {source_channel_id}"
-                            f" thread {source_thread_id or 'none'}"
-                            f" message {source_msg_id}"
-                            f" by {user_name}]\n"
-                            f"{task_text}"
-                        )
-                        message.content = normalized_content
-                        logger.info(
-                            "[%s] %s handoff trigger matched ('%s'): source=%s -> target_parent=%s thread=%s",
-                            self.name,
-                            route_label,
-                            matched_trigger,
-                            source_channel_id,
-                            target_parent_id,
-                            thread_id,
-                        )
+                routed_channel = self._client.get_channel(int(routed_thread_id))
+                if routed_channel is None:
+                    routed_channel = await self._client.fetch_channel(int(routed_thread_id))
+                if routed_channel is None:
+                    logger.warning(
+                        "[%s] %s handoff trigger matched but routed thread could not be resolved; dropping source-channel fallback: source=%s target_parent=%s thread=%s",
+                        self.name,
+                        route_label,
+                        source_channel_id,
+                        target_parent_id,
+                        routed_thread_id,
+                    )
+                    return
+
+                auto_threaded_channel = routed_channel
+                mention_prefix = True
+                is_thread = True
+                thread_id = str(routed_channel.id)
+                parent_channel_id = str(target_parent_id)
+                self._threads.mark(thread_id)
+
+                normalized_content = (
+                    f"[{route_label} handoff from channel {source_channel_id}"
+                    f" thread {source_thread_id or 'none'}"
+                    f" message {source_msg_id}"
+                    f" by {user_name}]\n"
+                    f"{task_text}"
+                )
+                message.content = normalized_content
+                logger.info(
+                    "[%s] %s handoff trigger matched ('%s'): source=%s -> target_parent=%s thread=%s",
+                    self.name,
+                    route_label,
+                    matched_trigger,
+                    source_channel_id,
+                    target_parent_id,
+                    thread_id,
+                )
             else:
                 logger.warning(
                     "[%s] %s handoff trigger matched but no target_channel_id configured",
@@ -4812,9 +4895,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
 
         if not isinstance(message.channel, discord.DMChannel):
-            channel_ids = {str(message.channel.id)}
-            if parent_channel_id:
-                channel_ids.add(parent_channel_id)
+            channel_ids = self._get_channel_scope_ids(message.channel, parent_channel_id)
 
             # Check allowed channels - if set, only respond in these channels
             allowed_channels_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "")

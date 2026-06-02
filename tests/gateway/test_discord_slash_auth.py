@@ -128,7 +128,7 @@ _SENTINEL = object()
 
 def _make_interaction(
     user_id, *, channel_id=12345, guild_id=42, in_dm=False, in_thread=False,
-    parent_channel_id=None, user=_SENTINEL,
+    parent_channel_id=None, category_id=None, user=_SENTINEL,
 ):
     """Build a mock Discord Interaction with a still-unresponded response.
 
@@ -143,11 +143,7 @@ def _make_interaction(
     if in_dm:
         channel = discord.DMChannel()
     elif in_thread:
-        channel = discord.Thread()
-        channel.id = channel_id
-        channel.parent_id = parent_channel_id
-    elif channel_id is None:
-        channel = None
+        channel = SimpleNamespace(id=channel_id, parent_id=parent_channel_id, category_id=category_id)
     else:
         channel = SimpleNamespace(id=channel_id)
 
@@ -471,6 +467,17 @@ async def test_thread_parent_in_allowlist_passes(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "5555")
     interaction = _make_interaction(
         "100200300", channel_id=9999, in_thread=True, parent_channel_id=5555,
+    )
+    assert await adapter._check_slash_authorization(interaction, "/help") is True
+
+
+@pytest.mark.asyncio
+async def test_thread_category_in_allowlist_passes(adapter, monkeypatch):
+    """Thread whose category is on DISCORD_ALLOWED_CHANNELS passes even if
+    the thread id and parent channel id are not on the list."""
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "5555")
+    interaction = _make_interaction(
+        "100200300", channel_id=9999, in_thread=True, category_id=5555,
     )
     assert await adapter._check_slash_authorization(interaction, "/help") is True
 

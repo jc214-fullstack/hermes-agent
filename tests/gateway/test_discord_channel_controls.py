@@ -56,11 +56,12 @@ class FakeDMChannel:
 
 
 class FakeTextChannel:
-    def __init__(self, channel_id: int = 1, name: str = "general", guild_name: str = "Hermes Server"):
+    def __init__(self, channel_id: int = 1, name: str = "general", guild_name: str = "Hermes Server", category_id: int | None = None):
         self.id = channel_id
         self.name = name
         self.guild = SimpleNamespace(name=guild_name)
         self.topic = None
+        self.category_id = category_id
 
 
 class FakeThread:
@@ -77,6 +78,19 @@ class FakeThread:
 def adapter(monkeypatch):
     monkeypatch.setattr(discord_platform.discord, "DMChannel", FakeDMChannel, raising=False)
     monkeypatch.setattr(discord_platform.discord, "Thread", FakeThread, raising=False)
+
+    # Clear DISCORD_* env vars this file depends on so local shell / gateway
+    # config does not leak into the test expectations. Individual tests still
+    # opt into the specific env they need with monkeypatch.setenv().
+    for _var in (
+        "DISCORD_REQUIRE_MENTION",
+        "DISCORD_FREE_RESPONSE_CHANNELS",
+        "DISCORD_AUTO_THREAD",
+        "DISCORD_NO_THREAD_CHANNELS",
+        "DISCORD_ALLOWED_CHANNELS",
+        "DISCORD_IGNORED_CHANNELS",
+    ):
+        monkeypatch.delenv(_var, raising=False)
 
     config = PlatformConfig(enabled=True, token="fake-token")
     adapter = DiscordAdapter(config)
@@ -98,6 +112,37 @@ def make_message(*, channel, content: str, mentions=None):
         channel=channel,
         author=author,
     )
+
+
+# ── allowed_channels ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_allowed_category_permits_child_channel(adapter, monkeypatch):
+    """Category IDs in allowed_channels should allow messages from child channels."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "333")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    message = make_message(channel=FakeTextChannel(channel_id=701, category_id=333), content="hello from allowed category")
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "hello from allowed category"
+
+
+@pytest.mark.asyncio
+async def test_non_allowed_category_child_is_blocked(adapter, monkeypatch):
+    """A child channel outside the configured allowed category should be blocked."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "333")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    message = make_message(channel=FakeTextChannel(channel_id=702, category_id=444), content="blocked")
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
 
 
 # ── ignored_channels ─────────────────────────────────────────────────
@@ -189,6 +234,19 @@ async def test_ignored_channel_thread_parent_match(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ignored_category_blocks_child_channel(adapter, monkeypatch):
+    """Category IDs in ignored_channels should silence child channels."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_IGNORED_CHANNELS", "444")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    message = make_message(channel=FakeTextChannel(channel_id=501, category_id=444), content="hello from ignored category")
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_dms_unaffected_by_ignored_channels(adapter, monkeypatch):
     """DMs should never be affected by ignored_channels."""
     monkeypatch.setenv("DISCORD_IGNORED_CHANNELS", "500")
@@ -215,6 +273,26 @@ async def test_no_thread_channel_skips_auto_thread(adapter, monkeypatch):
     adapter._auto_create_thread = AsyncMock(return_value=FakeThread(channel_id=999))
 
     message = make_message(channel=FakeTextChannel(channel_id=800), content="hello")
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "group"
+
+
+@pytest.mark.asyncio
+async def test_no_thread_category_skips_auto_thread(adapter, monkeypatch):
+    """Category IDs in no_thread_channels should suppress auto-threading for child channels."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_NO_THREAD_CHANNELS", "880")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    adapter._auto_create_thread = AsyncMock(return_value=FakeThread(channel_id=999))
+
+    message = make_message(channel=FakeTextChannel(channel_id=801, category_id=880), content="hello")
     await adapter._handle_message(message)
 
     adapter._auto_create_thread.assert_not_awaited()

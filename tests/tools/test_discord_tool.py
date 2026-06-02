@@ -440,6 +440,17 @@ class TestPinUnpinDelete:
         assert "deleted" in result["message"]
         mock_req.assert_called_once_with("DELETE", "/channels/11/messages/500", "test-token")
 
+    @patch("tools.discord_tool._discord_request")
+    def test_rename_channel(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "11", "name": "ResRace Compliance", "type": 11}
+        result = json.loads(discord_admin_handler(action="rename_channel", channel_id="11", name="ResRace Compliance"))
+        assert result["success"] is True
+        assert result["name"] == "ResRace Compliance"
+        mock_req.assert_called_once_with(
+            "PATCH", "/channels/11", "test-token", body={"name": "ResRace Compliance"}
+        )
+
 
 # ---------------------------------------------------------------------------
 # Action: create_thread
@@ -601,6 +612,7 @@ class TestRegistration:
         assert "list_guilds()" in desc
         assert "add_role(guild_id, user_id, role_id)" in desc
         assert "delete_message(channel_id, message_id)" in desc
+        assert "rename_channel(channel_id, name)" in desc
         # Core actions should NOT be in admin description
         assert "fetch_messages(" not in desc
         assert "create_thread(" not in desc
