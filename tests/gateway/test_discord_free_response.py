@@ -1002,6 +1002,33 @@ async def test_discord_auto_thread_skips_backfill(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_create_handoff_thread_uses_public_threads_for_text_channels(adapter, monkeypatch):
+    """Deep Work handoff threads should be public so the user can actually see the new thread."""
+    public_thread_type = SimpleNamespace(public_thread="public-thread")
+    monkeypatch.setattr(discord_platform.discord, "ChannelType", public_thread_type, raising=False)
+
+    captured_kwargs = {}
+
+    class DirectCreateParent(FakeTextChannel):
+        async def create_thread(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return FakeThread(channel_id=9010, name=kwargs.get("name", "handoff"), parent=self)
+
+    parent = DirectCreateParent(channel_id=1510042356487950376, name="deep-work")
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_channel=lambda cid: parent if int(cid) == parent.id else None,
+        fetch_channel=AsyncMock(return_value=parent),
+    )
+
+    thread_id = await adapter.create_handoff_thread(str(parent.id), "Deep Work — continue the migration thread")
+
+    assert thread_id == "9010"
+    assert captured_kwargs["name"] == "Deep Work — continue the migration thread"
+    assert captured_kwargs["type"] == public_thread_type.public_thread
+
+
+@pytest.mark.asyncio
 async def test_deep_work_trigger_routes_from_any_channel_without_mention(adapter, monkeypatch):
     """Trigger phrase should hand off into Deep Work even when require_mention is true."""
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
@@ -1076,6 +1103,110 @@ async def test_auto_run_deep_work_marker_forces_deep_work_thread(adapter, monkey
     assert "Deep Work handoff from channel 456" in event.text
     assert "[AUTO_RUN_DEEP_WORK]" not in event.text
     assert "Explain what DuckDB is" in event.text
+
+
+@pytest.mark.asyncio
+async def test_deep_work_handoff_packet_includes_recent_source_context(adapter, monkeypatch):
+    """Deep Work handoff should carry recent source-thread context into the new session."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+
+    deep_parent = "1510042356487950376"
+    deep_parent_channel = FakeTextChannel(channel_id=int(deep_parent), name="deep-work")
+    deep_thread = FakeThread(channel_id=9008, name="Deep Work — migration plan", parent=deep_parent_channel)
+
+    adapter.config.extra["deep_work_channel_id"] = deep_parent
+    adapter.config.extra["deep_work_trigger_phrases"] = ["push this to deep work"]
+    adapter.create_handoff_thread = AsyncMock(return_value=str(deep_thread.id))
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_channel=lambda cid: deep_thread if int(cid) == deep_thread.id else None,
+        fetch_channel=AsyncMock(return_value=deep_thread),
+    )
+
+    history_author = SimpleNamespace(id=77, display_name="Alice", name="Alice", bot=False)
+    source_channel = FakeHistoryChannel(
+        history_messages=[
+            make_history_message(
+                author=history_author,
+                content="We already agreed the backend needs migration planning before coding.",
+                msg_id=122,
+            )
+        ],
+        channel_id=123,
+        name="quick-work",
+    )
+    message = make_message(
+        channel=source_channel,
+        content="push this to deep work: turn the migration notes into an implementation plan",
+        mentions=[],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.create_handoff_thread.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == str(deep_thread.id)
+    assert "Deep Work handoff from channel 123" in event.text
+    assert "turn the migration notes into an implementation plan" in event.text
+    assert "[Recent channel messages]" in event.text
+    assert "backend needs migration planning before coding" in event.text
+
+
+@pytest.mark.asyncio
+async def test_deep_work_handoff_context_includes_prior_assistant_turn(adapter, monkeypatch):
+    """Deep Work handoff context must not stop at the bot's immediately prior answer."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "none")
+
+    deep_parent = "1510042356487950376"
+    deep_parent_channel = FakeTextChannel(channel_id=int(deep_parent), name="deep-work")
+    deep_thread = FakeThread(channel_id=9011, name="Deep Work — continue context", parent=deep_parent_channel)
+    bot_user = SimpleNamespace(id=999, display_name="Hermes-J214", name="Hermes-J214", bot=True)
+
+    adapter.config.extra["deep_work_channel_id"] = deep_parent
+    adapter.config.extra["deep_work_trigger_phrases"] = ["push this to deep work"]
+    adapter.create_handoff_thread = AsyncMock(return_value=str(deep_thread.id))
+    adapter._client = SimpleNamespace(
+        user=bot_user,
+        get_channel=lambda cid: deep_thread if int(cid) == deep_thread.id else None,
+        fetch_channel=AsyncMock(return_value=deep_thread),
+    )
+
+    history_author = SimpleNamespace(id=77, display_name="Alice", name="Alice", bot=False)
+    source_channel = FakeHistoryChannel(
+        history_messages=[
+            make_history_message(
+                author=bot_user,
+                content="You should test the Deep Work prompt again now.",
+                msg_id=122,
+            ),
+            make_history_message(
+                author=history_author,
+                content="Do I need to do anything else first?",
+                msg_id=121,
+            ),
+        ],
+        channel_id=123,
+        name="main-chat",
+    )
+    message = make_message(
+        channel=source_channel,
+        content="push this to deep work: continue this conversation in a new Deep Work thread with the prior context and latest request",
+        mentions=[],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.create_handoff_thread.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == str(deep_thread.id)
+    assert "[Recent channel messages]" in event.text
+    assert "[Hermes-J214 [bot]] You should test the Deep Work prompt again now." in event.text
+    assert "[Alice] Do I need to do anything else first?" in event.text
+    assert "[Latest user request]" in event.text
+    assert "continue this conversation in a new Deep Work thread" in event.text
 
 
 @pytest.mark.asyncio

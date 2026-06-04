@@ -3812,21 +3812,34 @@ class DiscordAdapter(BasePlatformAdapter):
         return phrases
 
     def _discord_handoff_routes(self) -> list[dict[str, Any]]:
-        """Return configured Discord handoff routes with Deep Work as legacy route.
+        """Return configured Discord handoff routes with external registry support.
 
-        Config format (``discord.handoff_routes``):
-
-            - label: "Deep Work"
-              target_channel_id: "1510042356487950376"
-              trigger_phrases: ["push this to deep work"]
-              auto_run_marker: "[AUTO_RUN_DEEP_WORK]"
-              thread_name_prefix: "Deep Work"
+        Sources are merged in this order:
+        1. shared external registry (``~/.hermes/hooks/system-b-handoffs/config.yaml``)
+        2. ``discord.handoff_routes`` in config.yaml
+        3. legacy Deep Work shortcut fields
 
         The target channel's ``channel_model_bindings`` entry supplies the model
         for the created thread via parent-channel inheritance.
         """
-        raw_routes = self.config.extra.get("handoff_routes")
+        from gateway.handoff_registry import discord_handoff_routes_from_registry
+
+        def _route_identity(route: dict[str, Any]) -> tuple[str, str]:
+            name = str(route.get("name") or route.get("label") or "").strip().lower()
+            target = str(route.get("target_channel_id") or "").strip()
+            return name, target
+
         routes: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+
+        for raw in discord_handoff_routes_from_registry():
+            identity = _route_identity(raw)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            routes.append(dict(raw))
+
+        raw_routes = self.config.extra.get("handoff_routes")
         if isinstance(raw_routes, list):
             for raw in raw_routes:
                 if not isinstance(raw, dict):
@@ -3841,15 +3854,18 @@ class DiscordAdapter(BasePlatformAdapter):
                     continue
                 route = dict(raw)
                 route["target_channel_id"] = target
+                identity = _route_identity(route)
+                if identity in seen:
+                    continue
+                seen.add(identity)
                 routes.append(route)
 
         # Backward compatibility for the existing Deep Work shortcut.
         deep_work_target = self._discord_deep_work_channel_id()
-        if deep_work_target and not any(
-            str(route.get("target_channel_id") or "").strip() == deep_work_target
-            for route in routes
-        ):
+        legacy_identity = ("deep work", deep_work_target)
+        if deep_work_target and legacy_identity not in seen:
             routes.append({
+                "name": "deep-work",
                 "label": "Deep Work",
                 "target_channel_id": deep_work_target,
                 "trigger_phrases": self._discord_deep_work_trigger_phrases(),
@@ -3964,12 +3980,21 @@ class DiscordAdapter(BasePlatformAdapter):
         self,
         channel: Any,
         before: "DiscordMessage",
+        *,
+        stop_at_self: bool = True,
+        include_self_messages: bool = False,
     ) -> str:
         """Fetch recent channel messages for conversational context.
 
         Scans backwards from *before* and collects messages until it hits
         a message sent by this bot (the natural partition point between
         bot turns) or reaches ``history_backfill_limit``.
+
+        Handoff kickoffs intentionally pass ``stop_at_self=False`` and
+        ``include_self_messages=True`` because the assistant turn immediately
+        before a handoff trigger is often the exact context the target lane
+        needs to continue. Normal shared-channel backfill keeps the older
+        partitioning behavior.
 
         Returns a formatted block like::
 
@@ -3995,7 +4020,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # trigger — Discord snowflake IDs are monotonically increasing, so
         # a simple int comparison suffices.
         channel_id = str(getattr(channel, "id", ""))
-        _cached_id = self._last_self_message_id.get(channel_id)
+        _cached_id = self._last_self_message_id.get(channel_id) if stop_at_self else None
         _after_obj = None
         try:
             if _cached_id and int(_cached_id) < int(before.id):
@@ -4005,6 +4030,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         try:
             collected = []
+            self_user = getattr(self._client, "user", None)
             # IMPORTANT: pass oldest_first=False explicitly.  discord.py 2.x
             # silently flips the default to True when `after=` is supplied,
             # which would select the *earliest* N messages after our last
@@ -4021,8 +4047,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Stop at our own message — this is the partition point.
                 # Everything before this is already in the session transcript.
                 # (Redundant when _after_obj is set, but needed for cold start.)
-                if msg.author == self._client.user:
-                    break
+                if msg.author == self_user:
+                    if stop_at_self:
+                        break
+                    if not include_self_messages:
+                        continue
 
                 # Skip system messages (pins, joins, thread renames, etc.)
                 if msg.type not in {discord.MessageType.default, discord.MessageType.reply}:
@@ -4031,7 +4060,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Respect DISCORD_ALLOW_BOTS for other bots.
                 # For history context, "mentions" is treated as "all" — we are
                 # deciding what context to show, not whether to respond.
-                if getattr(msg.author, "bot", False) and not include_other_bots:
+                if (
+                    getattr(msg.author, "bot", False)
+                    and msg.author != self_user
+                    and not include_other_bots
+                ):
                     continue
 
                 content = getattr(msg, "clean_content", msg.content) or ""
@@ -4240,15 +4273,24 @@ class DiscordAdapter(BasePlatformAdapter):
         thread_name = (name or "handoff").strip()[:80] or "handoff"
         reason = "Hermes session handoff"
 
-        # First try: create a thread directly on the channel.
+        # First try: create a public thread directly on the channel so the
+        # destination is visible to the user in Deep Work. Discord's direct
+        # create_thread path defaults to a private thread when no starter
+        # message/type is supplied, which made successful handoffs look like
+        # they never created anything from the user's perspective.
         try:
             create = getattr(parent, "create_thread", None)
             if create is not None:
-                thread = await create(
-                    name=thread_name,
-                    auto_archive_duration=1440,
-                    reason=reason,
-                )
+                create_kwargs = {
+                    "name": thread_name,
+                    "auto_archive_duration": 1440,
+                    "reason": reason,
+                }
+                channel_type = getattr(discord, "ChannelType", None)
+                public_thread_type = getattr(channel_type, "public_thread", None)
+                if public_thread_type is not None:
+                    create_kwargs["type"] = public_thread_type
+                thread = await create(**create_kwargs)
                 return str(thread.id)
         except Exception as direct_error:
             logger.debug(
@@ -4834,6 +4876,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 if not task_text:
                     task_text = f"Continue this task in {route_label}. Ask one clarification question if needed and proceed."
 
+                source_context = ""
+                if not isinstance(message.channel, discord.DMChannel) and self._discord_history_backfill():
+                    source_context = await self._fetch_channel_context(
+                        message.channel,
+                        before=message,
+                        stop_at_self=False,
+                        include_self_messages=True,
+                    )
+
                 thread_name_prefix = str(handoff_route.get("thread_name_prefix") or route_label).strip() or "Handoff"
                 thread_name_seed = task_text[:56].strip() or "handoff"
                 thread_name = f"{thread_name_prefix} — {thread_name_seed}"[:80]
@@ -4875,8 +4926,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     f" thread {source_thread_id or 'none'}"
                     f" message {source_msg_id}"
                     f" by {user_name}]\n"
-                    f"{task_text}"
                 )
+                if source_context:
+                    normalized_content += f"{source_context}\n\n"
+                normalized_content += f"[Latest user request]\n{task_text}"
                 message.content = normalized_content
                 logger.info(
                     "[%s] %s handoff trigger matched ('%s'): source=%s -> target_parent=%s thread=%s",
