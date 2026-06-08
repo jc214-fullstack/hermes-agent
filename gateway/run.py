@@ -3923,13 +3923,47 @@ class GatewayRunner:
                     e,
                 )
 
+    def _shutdown_boundary_reason(self) -> str:
+        return "gateway_restart" if getattr(self, "_restart_requested", False) else "gateway_shutdown"
+
+    def _source_override_for_session_key(self, session_key: str) -> Optional[dict[str, Any]]:
+        try:
+            entry = getattr(self.session_store, "_entries", {}).get(session_key)
+            origin = getattr(entry, "origin", None)
+            if origin is not None:
+                return origin.to_dict()
+        except Exception:
+            pass
+        try:
+            source = self._get_cached_session_source(session_key)
+            if source is not None:
+                return source.to_dict()
+        except Exception:
+            pass
+        return None
+
     def _finalize_shutdown_agents(self, active_agents: Dict[str, Any]) -> None:
-        for agent in active_agents.values():
+        _boundary_reason = self._shutdown_boundary_reason()
+        for session_key, agent in active_agents.items():
+            _session_id = getattr(agent, "session_id", None)
+            _messages = list(getattr(agent, "conversation_history", []) or [])
+            try:
+                from agent.session_lifecycle_writeback import finalize_session as _finalize_session_writeback
+                _finalize_session_writeback(
+                    agent=agent,
+                    session_id=_session_id or session_key,
+                    boundary_reason=_boundary_reason,
+                    messages=_messages,
+                    source_override=self._source_override_for_session_key(session_key),
+                    metadata={"session_key": session_key, "restart_requested": bool(getattr(self, "_restart_requested", False))},
+                )
+            except Exception:
+                pass
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
                 _invoke_hook(
                     "on_session_finalize",
-                    session_id=getattr(agent, "session_id", None),
+                    session_id=_session_id,
                     platform="gateway",
                     reason="shutdown",
                 )
@@ -6737,12 +6771,25 @@ class GatewayRunner:
             _cache = getattr(self, "_agent_cache", None)
             if _cache_lock is not None and _cache is not None:
                 with _cache_lock:
-                    _idle_agents = list(_cache.values())
+                    _idle_agents = list(_cache.items())
                     _cache.clear()
-                for _entry in _idle_agents:
+                _boundary_reason = self._shutdown_boundary_reason()
+                for _session_key, _entry in _idle_agents:
                     _agent = (
                         _entry[0] if isinstance(_entry, tuple) else _entry
                     )
+                    try:
+                        from agent.session_lifecycle_writeback import finalize_session as _finalize_session_writeback
+                        _finalize_session_writeback(
+                            agent=_agent,
+                            session_id=getattr(_agent, "session_id", None) or _session_key,
+                            boundary_reason=_boundary_reason,
+                            messages=list(getattr(_agent, "conversation_history", []) or []),
+                            source_override=self._source_override_for_session_key(_session_key),
+                            metadata={"session_key": _session_key, "restart_requested": bool(getattr(self, "_restart_requested", False))},
+                        )
+                    except Exception:
+                        pass
                     self._cleanup_agent_resources(_agent)
 
             for platform, adapter in list(self.adapters.items()):

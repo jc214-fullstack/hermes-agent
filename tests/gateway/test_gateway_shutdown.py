@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -7,7 +8,7 @@ import gateway.run as gateway_run
 from gateway.config import HomeChannel, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
-from gateway.session import build_session_key
+from gateway.session import SessionEntry, build_session_key
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
 
@@ -47,6 +48,79 @@ def test_cleanup_agent_resources_reaps_stale_aux_clients():
     agent.shutdown_memory_provider.assert_called_once()
     agent.close.assert_called_once()
     cleanup_mock.assert_called_once()
+
+
+def test_finalize_shutdown_agents_writes_lifecycle_payload_with_source_context():
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(thread_id="42")
+    session_key = build_session_key(source)
+    runner.session_store._entries[session_key] = SessionEntry(
+        session_key=session_key,
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        origin=source,
+    )
+    agent = MagicMock()
+    agent.session_id = "sess-1"
+    agent.conversation_history = [{"role": "user", "content": "restart me"}]
+
+    with patch("agent.session_lifecycle_writeback.finalize_session") as mock_finalize:
+        runner._finalize_shutdown_agents({session_key: agent})
+
+    mock_finalize.assert_called_once()
+    kwargs = mock_finalize.call_args.kwargs
+    assert kwargs["session_id"] == "sess-1"
+    assert kwargs["boundary_reason"] == "gateway_shutdown"
+    assert kwargs["messages"] == agent.conversation_history
+    assert kwargs["source_override"]["chat_id"] == source.chat_id
+    assert kwargs["source_override"]["thread_id"] == source.thread_id
+    assert kwargs["metadata"]["session_key"] == session_key
+    assert kwargs["metadata"]["restart_requested"] is False
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_finalizes_idle_cached_agents_for_restart():
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    runner._restart_requested = True
+    source = make_restart_source(thread_id="42")
+    session_key = build_session_key(source)
+    runner.session_store._entries[session_key] = SessionEntry(
+        session_key=session_key,
+        session_id="sess-idle",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        origin=source,
+    )
+    cached_agent = MagicMock()
+    cached_agent.session_id = "sess-idle"
+    cached_agent.conversation_history = [{"role": "assistant", "content": "cached context"}]
+    with runner._agent_cache_lock:
+        runner._agent_cache[session_key] = cached_agent
+
+    with (
+        patch("gateway.status.remove_pid_file"),
+        patch("gateway.status.write_runtime_status"),
+        patch("agent.auxiliary_client.shutdown_cached_clients"),
+        patch("agent.session_lifecycle_writeback.finalize_session") as mock_finalize,
+    ):
+        await runner.stop(restart=True)
+
+    mock_finalize.assert_called_once()
+    kwargs = mock_finalize.call_args.kwargs
+    assert kwargs["session_id"] == "sess-idle"
+    assert kwargs["boundary_reason"] == "gateway_restart"
+    assert kwargs["messages"] == cached_agent.conversation_history
+    assert kwargs["source_override"]["chat_id"] == source.chat_id
+    assert kwargs["metadata"]["restart_requested"] is True
+
+    with runner._agent_cache_lock:
+        assert runner._agent_cache == {}
 
 
 @pytest.mark.asyncio
