@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -13,7 +12,9 @@ from typing import Any
 
 from hermes_cli.loadout_cli import (
     _apply_loadout,
-    _default_runtime_home,
+    _claude_home_override_allowed,
+    _find_runtime_binary,
+    _launch_env,
     _repo_root,
     _runtime_home,
 )
@@ -70,17 +71,6 @@ def _extract_claude_result(stdout: str) -> Any:
         return None
 
 
-def _validate_home_override(runtime: str, home: Path) -> None:
-    if runtime != "claude":
-        return
-    default_home = _default_runtime_home("claude")
-    if home != default_home:
-        raise ValueError(
-            "Claude launch currently supports only the default live home. "
-            f"Use {default_home} or omit home."
-        )
-
-
 def _run_terminal_agent(
     *,
     task: str,
@@ -100,14 +90,10 @@ def _run_terminal_agent(
         args = type("Args", (), {"repo": repo})()
         repo_root = _repo_root(args)
         runtime_home = _runtime_home(selected_runtime, home)
-        _validate_home_override(selected_runtime, runtime_home)
+        _claude_home_override_allowed(selected_runtime, runtime_home)
         workdir = str(Path(cwd).expanduser()) if cwd else os.getcwd()
 
-        if not shutil.which(RUNTIME_BINARIES[selected_runtime]):
-            return tool_error(
-                f"Could not find `{RUNTIME_BINARIES[selected_runtime]}` on PATH",
-                success=False,
-            )
+        _find_runtime_binary(selected_runtime)
 
         if dry_run:
             with tempfile.TemporaryDirectory(prefix=f"terminal-agent-{selected_runtime}-") as tmp_dir:
@@ -130,6 +116,7 @@ def _run_terminal_agent(
                     "applied_loadout": manifest.get("loadout"),
                     "manifest_path": apply_result.get("manifest_path"),
                     "launch_notice": apply_result.get("launch_notice"),
+                    "launch": manifest.get("launch"),
                     "command": command,
                     "dry_run": True,
                 }
@@ -155,13 +142,12 @@ def _run_terminal_agent(
             "applied_loadout": manifest.get("loadout"),
             "manifest_path": apply_result.get("manifest_path"),
             "launch_notice": apply_result.get("launch_notice"),
+            "launch": manifest.get("launch"),
             "command": command,
             "dry_run": dry_run,
         }
 
-        env = os.environ.copy()
-        if selected_runtime == "codex":
-            env["CODEX_HOME"] = str(runtime_home)
+        env = _launch_env(selected_runtime, runtime_home, manifest)
 
         completed = subprocess.run(
             command,

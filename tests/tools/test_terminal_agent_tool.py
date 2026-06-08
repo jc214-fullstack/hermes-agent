@@ -50,15 +50,19 @@ def test_dry_run_returns_launch_plan(monkeypatch, tmp_path):
     runtime_home = tmp_path / ".claude"
     runtime_home.mkdir()
 
-    monkeypatch.setattr("tools.terminal_agent_tool.shutil.which", lambda _name: "/usr/bin/claude")
+    monkeypatch.setattr("tools.terminal_agent_tool._find_runtime_binary", lambda _name: "/usr/bin/claude")
     monkeypatch.setattr("tools.terminal_agent_tool._repo_root", lambda _args: tmp_path)
     monkeypatch.setattr("tools.terminal_agent_tool._runtime_home", lambda runtime, home=None: runtime_home)
-    monkeypatch.setattr("tools.terminal_agent_tool._validate_home_override", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("tools.terminal_agent_tool._claude_home_override_allowed", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         "tools.terminal_agent_tool._apply_loadout",
         lambda *args, **kwargs: {
             "manifest_path": str(runtime_home / "hermes-loadout.json"),
-            "manifest": {"loadout": "research", "runtime": "claude"},
+            "manifest": {
+                "loadout": "research",
+                "runtime": "claude",
+                "launch": {"env": {"HOME": "/home/dylan-malik"}},
+            },
             "launch_notice": "CLAUDE CODE | loadout: research | session: fresh | cwd: tmp_path",
         },
     )
@@ -71,23 +75,28 @@ def test_dry_run_returns_launch_plan(monkeypatch, tmp_path):
     assert payload["applied_loadout"] == "research"
     assert payload["dry_run"] is True
     assert payload["launch_notice"] == "CLAUDE CODE | loadout: research | session: fresh | cwd: tmp_path"
+    assert payload["launch"]["env"]["HOME"] == "/home/dylan-malik"
     assert payload["command"][0] == "claude"
 
 
-def test_live_run_executes_codex_and_sets_codex_home(monkeypatch, tmp_path):
+def test_live_run_executes_codex_and_sets_launch_env(monkeypatch, tmp_path):
     runtime_home = tmp_path / ".codex"
     runtime_home.mkdir()
     recorded = {}
 
-    monkeypatch.setattr("tools.terminal_agent_tool.shutil.which", lambda _name: "/usr/bin/codex")
+    monkeypatch.setattr("tools.terminal_agent_tool._find_runtime_binary", lambda _name: "/usr/bin/codex")
     monkeypatch.setattr("tools.terminal_agent_tool._repo_root", lambda _args: tmp_path)
     monkeypatch.setattr("tools.terminal_agent_tool._runtime_home", lambda runtime, home=None: runtime_home)
-    monkeypatch.setattr("tools.terminal_agent_tool._validate_home_override", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("tools.terminal_agent_tool._claude_home_override_allowed", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         "tools.terminal_agent_tool._apply_loadout",
         lambda *args, **kwargs: {
             "manifest_path": str(runtime_home / "hermes-loadout.json"),
-            "manifest": {"loadout": "builder", "runtime": "codex"},
+            "manifest": {
+                "loadout": "builder",
+                "runtime": "codex",
+                "launch": {"env": {"HOME": "/home/dylan-malik", "EXTRA": "1"}},
+            },
             "launch_notice": "CODEX | loadout: builder | session: fresh | cwd: testdir",
         },
     )
@@ -114,6 +123,9 @@ def test_live_run_executes_codex_and_sets_codex_home(monkeypatch, tmp_path):
     assert payload["runtime"] == "codex"
     assert payload["exit_code"] == 0
     assert payload["stdout"] == "done"
+    assert payload["launch"]["env"]["HOME"] == "/home/dylan-malik"
     assert recorded["command"] == ["codex", "exec", "--full-auto", "Use Codex to update tests"]
     assert recorded["cwd"] == str(tmp_path)
+    assert recorded["env"]["HOME"] == "/home/dylan-malik"
+    assert recorded["env"]["EXTRA"] == "1"
     assert recorded["env"]["CODEX_HOME"] == str(runtime_home)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import shutil
 import subprocess
 import sys
@@ -10,22 +11,39 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-DEFAULT_LOADOUT_REPO = Path.home() / "projects" / "hermes-coding-terminal-load-out-system"
-DEFAULT_RUNTIME_HOMES = {
-    "claude": Path.home() / ".claude",
-    "codex": Path.home() / ".codex",
-}
 RUNTIME_BINARIES = {
     "claude": "claude",
     "codex": "codex",
 }
 
 
+def _real_user_home() -> Path:
+    override = os.environ.get("HERMES_LOADOUT_USER_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    if os.name != "nt":
+        try:
+            return Path(pwd.getpwuid(os.getuid()).pw_dir)
+        except (KeyError, OSError):
+            pass
+    user_profile = os.environ.get("USERPROFILE", "").strip()
+    if user_profile:
+        return Path(user_profile).expanduser()
+    home = os.environ.get("HOME", "").strip()
+    if home:
+        return Path(home).expanduser()
+    return Path.home()
+
+
+def _default_loadout_repo() -> Path:
+    return _real_user_home() / "projects" / "hermes-coding-terminal-load-out-system"
+
+
 def _repo_root(args) -> Path:
     repo = Path(
         getattr(args, "repo", None)
         or os.environ.get("HERMES_LOADOUT_REPO")
-        or DEFAULT_LOADOUT_REPO
+        or _default_loadout_repo()
     ).expanduser()
     script = repo / "scripts" / "apply_loadout.py"
     if not script.exists():
@@ -36,14 +54,16 @@ def _repo_root(args) -> Path:
     return repo
 
 
-def _runtime_home(runtime: str, explicit: str | None = None) -> Path:
-    if runtime not in DEFAULT_RUNTIME_HOMES:
-        raise KeyError(f"Unknown runtime: {runtime}")
-    return Path(explicit).expanduser() if explicit else DEFAULT_RUNTIME_HOMES[runtime]
-
-
 def _default_runtime_home(runtime: str) -> Path:
-    return DEFAULT_RUNTIME_HOMES[runtime]
+    if runtime == "claude":
+        return _real_user_home() / ".claude"
+    if runtime == "codex":
+        return _real_user_home() / ".codex"
+    raise KeyError(f"Unknown runtime: {runtime}")
+
+
+def _runtime_home(runtime: str, explicit: str | None = None) -> Path:
+    return Path(explicit).expanduser() if explicit else _default_runtime_home(runtime)
 
 
 def _manifest_path(runtime: str, home: Path | None = None) -> Path:
@@ -226,6 +246,24 @@ def _claude_home_override_allowed(runtime: str, home: Path) -> None:
         )
 
 
+def _find_runtime_binary(runtime: str) -> str:
+    binary = shutil.which(RUNTIME_BINARIES[runtime])
+    if not binary:
+        raise FileNotFoundError(f"Could not find `{RUNTIME_BINARIES[runtime]}` on PATH")
+    return binary
+
+
+def _launch_env(runtime: str, home: Path, manifest: dict[str, Any] | None = None) -> dict[str, str]:
+    env = os.environ.copy()
+    launch = (manifest or {}).get("launch") or {}
+    launch_env = launch.get("env") or {}
+    for key, value in launch_env.items():
+        env[str(key)] = str(value)
+    if runtime == "codex":
+        env["CODEX_HOME"] = str(home)
+    return env
+
+
 def _cmd_launch(args) -> int:
     repo_root = _repo_root(args)
     runtime = args.runtime
@@ -244,17 +282,17 @@ def _cmd_launch(args) -> int:
                 target_home=False,
                 cwd=cwd,
             )
-            binary = shutil.which(RUNTIME_BINARIES[runtime])
-            if not binary:
-                raise FileNotFoundError(f"Could not find `{RUNTIME_BINARIES[runtime]}` on PATH")
+            manifest = result.get("manifest") or {}
+            binary = _find_runtime_binary(runtime)
             child_args = list(args.arg or [])
             payload = {
                 "runtime": runtime,
                 "home": str(home),
                 "cwd": cwd,
-                "applied_loadout": (result.get("manifest") or {}).get("loadout"),
+                "applied_loadout": manifest.get("loadout"),
                 "manifest_path": result.get("manifest_path"),
                 "launch_notice": result.get("launch_notice"),
+                "launch": manifest.get("launch"),
                 "command": [binary, *child_args],
                 "dry_run": True,
             }
@@ -269,25 +307,12 @@ def _cmd_launch(args) -> int:
         target_home=True,
         cwd=cwd,
     )
-    binary = shutil.which(RUNTIME_BINARIES[runtime])
-    if not binary:
-        raise FileNotFoundError(f"Could not find `{RUNTIME_BINARIES[runtime]}` on PATH")
+    manifest = result.get("manifest") or {}
+    binary = _find_runtime_binary(runtime)
 
     child_args = list(args.arg or [])
     cmd = [binary, *child_args]
-    env = os.environ.copy()
-    if runtime == "codex":
-        env["CODEX_HOME"] = str(home)
-
-    payload = {
-        "runtime": runtime,
-        "home": str(home),
-        "cwd": cwd,
-        "applied_loadout": (result.get("manifest") or {}).get("loadout"),
-        "manifest_path": result.get("manifest_path"),
-        "launch_notice": result.get("launch_notice"),
-        "command": cmd,
-    }
+    env = _launch_env(runtime, home, manifest)
 
     if result.get("launch_notice"):
         print(result["launch_notice"])
@@ -327,7 +352,7 @@ def add_parser(subparsers) -> None:
     parser.add_argument(
         "--repo",
         default=None,
-        help=f"Path to the loadout repo (default: {DEFAULT_LOADOUT_REPO})",
+        help="Path to the loadout repo (default: <real-user-home>/projects/hermes-coding-terminal-load-out-system)",
     )
     parser.add_argument("--json", action="store_true", help="Print JSON output when supported")
     sub = parser.add_subparsers(dest="loadout_command")

@@ -14,13 +14,21 @@ class DummyCompleted:
         self.stderr = stderr
 
 
+def test_real_user_home_prefers_gateway_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_LOADOUT_USER_HOME", str(tmp_path))
+    assert loadout_cli._real_user_home() == tmp_path
+    assert loadout_cli._default_loadout_repo() == tmp_path / "projects" / "hermes-coding-terminal-load-out-system"
+    assert loadout_cli._default_runtime_home("claude") == tmp_path / ".claude"
+    assert loadout_cli._default_runtime_home("codex") == tmp_path / ".codex"
+
+
 def test_status_reads_manifest_from_runtime_home(monkeypatch, capsys, tmp_path):
     home = tmp_path / ".claude"
     home.mkdir()
     manifest = {"runtime": "claude", "loadout": "frontend-design", "managed_files": ["a", "b"]}
     (home / "hermes-loadout.json").write_text(json.dumps(manifest), encoding="utf-8")
 
-    monkeypatch.setitem(loadout_cli.DEFAULT_RUNTIME_HOMES, "claude", home)
+    monkeypatch.setenv("HERMES_LOADOUT_USER_HOME", str(tmp_path))
 
     args = argparse.Namespace(runtime="claude", json=True)
     assert loadout_cli._cmd_status(args) == 0
@@ -81,6 +89,15 @@ def test_apply_parses_repo_json(monkeypatch, tmp_path):
     assert payload["launch_notice"] == "[hermes-terminal-loadout]"
 
 
+def test_launch_env_applies_manifest_env_and_codex_home(tmp_path):
+    home = tmp_path / ".codex"
+    manifest = {"launch": {"env": {"HOME": "/real/home", "FOO": "bar"}}}
+    env = loadout_cli._launch_env("codex", home, manifest)
+    assert env["HOME"] == "/real/home"
+    assert env["FOO"] == "bar"
+    assert env["CODEX_HOME"] == str(home)
+
+
 def test_launch_dry_run_applies_loadout_and_builds_command(monkeypatch, capsys, tmp_path):
     repo = tmp_path / "repo"
     scripts = repo / "scripts"
@@ -93,15 +110,19 @@ def test_launch_dry_run_applies_loadout_and_builds_command(monkeypatch, capsys, 
     workdir.mkdir()
     captured = {}
 
-    monkeypatch.setitem(loadout_cli.DEFAULT_RUNTIME_HOMES, "codex", home)
-    monkeypatch.setattr(loadout_cli.shutil, "which", lambda _: "/usr/bin/codex")
+    monkeypatch.setenv("HERMES_LOADOUT_USER_HOME", str(tmp_path))
+    monkeypatch.setattr(loadout_cli, "_find_runtime_binary", lambda _: "/usr/bin/codex")
 
     def fake_apply(*args, **kwargs):
         captured.update(kwargs)
         return {
             "output_root": str(home),
             "manifest_path": str(home / "hermes-loadout.json"),
-            "manifest": {"runtime": "codex", "loadout": "research"},
+            "manifest": {
+                "runtime": "codex",
+                "loadout": "research",
+                "launch": {"env": {"HOME": "/home/dylan-malik"}},
+            },
             "launch_notice": "CODEX | loadout: research | session: fresh | cwd: project",
         }
 
@@ -124,6 +145,7 @@ def test_launch_dry_run_applies_loadout_and_builds_command(monkeypatch, capsys, 
     assert payload["command"] == ["/usr/bin/codex", "exec", "--help"]
     assert payload["cwd"] == str(workdir)
     assert payload["launch_notice"] == "CODEX | loadout: research | session: fresh | cwd: project"
+    assert payload["launch"]["env"]["HOME"] == "/home/dylan-malik"
     assert captured["cwd"] == str(workdir)
 
 
