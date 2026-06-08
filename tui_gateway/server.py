@@ -334,6 +334,23 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
 
     session_key = session.get("session_key")
     session_id = getattr(agent, "session_id", None) or session_key
+    try:
+        from agent.session_lifecycle_writeback import finalize_session as _finalize_session_writeback
+        _finalize_session_writeback(
+            agent=agent,
+            session_id=session_id or "",
+            boundary_reason=end_reason,
+            messages=history,
+            source_override={
+                "platform": "local",
+                "chat_id": session_key,
+                "chat_name": "Hermes TUI",
+                "chat_type": "local",
+                "gateway_session_key": session_key,
+            },
+        )
+    except Exception:
+        pass
     _notify_session_boundary("on_session_finalize", session_id)
 
     # Mark session ended in DB so it doesn't linger as a ghost row in /resume.

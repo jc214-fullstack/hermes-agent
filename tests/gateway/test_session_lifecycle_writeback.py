@@ -130,6 +130,7 @@ async def test_session_expiry_watcher_finalizes_writeback_before_cleanup():
         updated_at=datetime.now() - timedelta(hours=2),
         platform=Platform.TELEGRAM,
         chat_type="dm",
+        origin=_make_source(),
     )
     expired_entry.expiry_finalized = False
 
@@ -142,6 +143,7 @@ async def test_session_expiry_watcher_finalizes_writeback_before_cleanup():
     runner.session_store._ensure_loaded = MagicMock()
     runner.session_store._entries = {session_key: expired_entry}
     runner.session_store._is_session_expired = MagicMock(return_value=True)
+    runner.session_store._should_reset = MagicMock(return_value="daily")
     runner.session_store._lock = MagicMock()
     runner.session_store._lock.__enter__ = MagicMock(return_value=None)
     runner.session_store._lock.__exit__ = MagicMock(return_value=None)
@@ -163,7 +165,56 @@ async def test_session_expiry_watcher_finalizes_writeback_before_cleanup():
     mock_finalize.assert_called_once()
     kwargs = mock_finalize.call_args.kwargs
     assert kwargs["session_id"] == "sess-expired"
-    assert kwargs["boundary_reason"] == "session_expired"
+    assert kwargs["boundary_reason"] == "daily_rollover"
     assert kwargs["messages"] == cached_agent.conversation_history
     assert kwargs["metadata"]["session_key"] == session_key
+    assert kwargs["source_override"]["chat_id"] == "c1"
     runner._cleanup_agent_resources.assert_called_once_with(cached_agent)
+
+
+def test_build_payload_includes_summary_context_and_todos():
+    from agent.session_lifecycle_writeback import build_payload
+
+    class _TodoStore:
+        def read(self):
+            return [
+                {"id": "audit", "content": "Audit remaining session hooks", "status": "in_progress"},
+                {"id": "done", "content": "Old thing", "status": "completed"},
+            ]
+
+        def format_for_injection(self):
+            return "[Your active task list was preserved across context compression]"
+
+    agent = SimpleNamespace(
+        _todo_store=_TodoStore(),
+        _session_db=SimpleNamespace(get_session_title=lambda session_id: "Lifecycle audit"),
+        _gateway_session_key="gateway:123",
+    )
+    payload = build_payload(
+        agent=agent,
+        messages=[
+            {"role": "user", "content": "Please review the remaining session lifecycle work and continue it."},
+            {"role": "assistant", "content": "I reviewed the current implementation and found follow-up items."},
+        ],
+        boundary_reason="new_session",
+        session_id="sess-123",
+        source_override={
+            "platform": "discord",
+            "chat_id": "chan-1",
+            "thread_id": "thread-1",
+            "parent_chat_id": "parent-1",
+        },
+    )
+
+    assert payload["platform"] == "discord"
+    assert payload["chat_id"] == "chan-1"
+    assert payload["parent_channel_id"] == "parent-1"
+    assert payload["thread_id"] == "thread-1"
+    assert payload["title"] == "Lifecycle audit"
+    assert payload["objective"].startswith("Please review the remaining session lifecycle work")
+    assert payload["summary_title"] == "Lifecycle audit"
+    assert payload["source"]["transcript_session_id"] == "sess-123"
+    assert payload["state"]["todo_state"][0]["id"] == "audit"
+    assert payload["state"]["open_loops"] == ["Audit remaining session hooks"]
+    assert payload["state"]["next_steps"] == ["Audit remaining session hooks"]
+    assert payload["what_happened"][0] == "Conversation captured 2 messages."

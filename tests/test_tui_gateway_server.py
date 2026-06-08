@@ -152,6 +152,31 @@ def test_write_json_returns_false_on_broken_pipe(monkeypatch):
     assert server.write_json({"ok": True}) is False
 
 
+def test_finalize_session_triggers_lifecycle_writeback(monkeypatch):
+    session = {
+        "agent": types.SimpleNamespace(session_id="tui-session", commit_memory_session=lambda history: None),
+        "session_key": "tui-key",
+        "history": [{"role": "user", "content": "close this session cleanly"}],
+    }
+    captured = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    with patch("agent.session_lifecycle_writeback.finalize_session", side_effect=_capture) as mock_finalize:
+        server._finalize_session(session, end_reason="tui_close")
+
+    mock_finalize.assert_called_once()
+    assert captured["session_id"] == "tui-session"
+    assert captured["boundary_reason"] == "tui_close"
+    assert captured["messages"] == session["history"]
+    assert captured["source_override"]["platform"] == "local"
+    assert captured["source_override"]["chat_id"] == "tui-key"
+
+
 def test_tui_verbose_tool_details_fail_closed_when_redaction_fails(monkeypatch):
     redact_module = types.ModuleType("agent.redact")
 

@@ -5187,11 +5187,21 @@ class GatewayRunner:
                             _cached_messages = list(getattr(_cached_agent, "conversation_history", []) or [])
                         try:
                             from agent.session_lifecycle_writeback import finalize_session as _finalize_session_writeback
+                            _boundary_reason = "idle_expiry"
+                            try:
+                                _reset_reason = None
+                                if getattr(entry, "origin", None) is not None:
+                                    _reset_reason = self.session_store._should_reset(entry, entry.origin)
+                                if _reset_reason == "daily":
+                                    _boundary_reason = "daily_rollover"
+                            except Exception:
+                                pass
                             _finalize_session_writeback(
                                 agent=_cached_agent if _cached_agent is not _AGENT_PENDING_SENTINEL else None,
                                 session_id=entry.session_id,
-                                boundary_reason="session_expired",
+                                boundary_reason=_boundary_reason,
                                 messages=_cached_messages,
+                                source_override=entry.origin.to_dict() if getattr(entry, "origin", None) else None,
                                 metadata={"session_key": key},
                             )
                         except Exception:
