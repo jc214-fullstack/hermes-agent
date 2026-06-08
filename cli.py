@@ -6726,9 +6726,29 @@ class HermesCLI:
         if self.agent and self.conversation_history:
             # Trigger memory extraction on the old session before session_id rotates.
             self.agent.commit_memory_session(self.conversation_history)
+            try:
+                from agent.session_lifecycle_writeback import finalize_session as _finalize_session_writeback
+                _finalize_session_writeback(
+                    agent=self.agent,
+                    session_id=self.session_id,
+                    boundary_reason="new_session",
+                    messages=self.conversation_history,
+                )
+            except Exception:
+                pass
             self._notify_session_boundary("on_session_finalize")
         elif self.agent:
             # First session or empty history — still finalize the old session
+            try:
+                from agent.session_lifecycle_writeback import finalize_session as _finalize_session_writeback
+                _finalize_session_writeback(
+                    agent=self.agent,
+                    session_id=self.session_id,
+                    boundary_reason="new_session",
+                    messages=[],
+                )
+            except Exception:
+                pass
             self._notify_session_boundary("on_session_finalize")
 
         old_session_id = self.session_id

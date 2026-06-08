@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Optional, Tuple
 
 from agent.model_metadata import estimate_request_tokens_rough
+from agent.session_lifecycle_writeback import checkpoint_from_compression
 
 logger = logging.getLogger(__name__)
 
@@ -568,6 +569,19 @@ def compress_context(
             )
     except Exception as _me_err:
         logger.debug("memory manager on_session_switch (compression): %s", _me_err)
+
+    try:
+        _old_sid = locals().get("old_session_id")
+        if _old_sid:
+            checkpoint_from_compression(
+                agent=agent,
+                old_session_id=_old_sid,
+                new_session_id=agent.session_id or "",
+                original_messages=messages,
+                compressed_messages=compressed,
+            )
+    except Exception as _wb_err:
+        logger.debug("session lifecycle checkpoint (compression): %s", _wb_err)
 
     # Warn on repeated compressions (quality degrades with each pass)
     _cc = agent.context_compressor.compression_count
