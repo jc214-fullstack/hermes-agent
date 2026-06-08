@@ -80,6 +80,34 @@ With `group_sessions_per_user: false`:
 - the whole room shares one running-agent slot for that channel/thread
 - follow-up messages from different people can interrupt or queue behind each other
 
+### Channel Handoffs and Per-Room Models
+
+Discord can also act as a routing surface instead of just a chat surface. With `channel_model_bindings`, `handoff_routes`, and an optional intake channel, you can make one room behave like a lightweight triage lane and automatically push heavier work into a different parent channel.
+
+Typical pattern:
+
+```yaml
+discord:
+  free_response_channels:
+    - QUICK_WORK_CHANNEL_ID
+  no_thread_channels:
+    - QUICK_WORK_CHANNEL_ID
+  channel_model_bindings:
+    - id: "DEEP_WORK_PARENT_CHANNEL_ID"
+      model: gpt-5.5
+      provider: openai-codex
+      base_url: https://chatgpt.com/backend-api/codex
+  handoff_routes:
+    - label: Deep Work
+      target_channel_id: "DEEP_WORK_PARENT_CHANNEL_ID"
+      trigger_phrases:
+        - push this to deep work
+      auto_run_marker: "[AUTO_RUN_DEEP_WORK]"
+      thread_name_prefix: Deep Work
+```
+
+When a message starts with a matching trigger phrase, Hermes creates a new thread under the destination parent channel, posts the rewritten task there, and the new thread inherits the destination channel's model binding. This lets you keep a fast intake room and a separate execution lane without running multiple bots.
+
 This guide walks you through the full setup process — from creating your bot on Discord's Developer Portal to sending your first message.
 
 ## Step 1: Create a Discord Application
@@ -313,6 +341,9 @@ discord:
   reactions: true                 # Add emoji reactions during processing
   ignored_channels: []            # Channel IDs where bot never responds
   no_thread_channels: []          # Channel IDs where bot responds without threading
+  channel_model_bindings: []      # Optional per-channel/per-thread model bindings
+  handoff_routes: []              # Optional trigger-based cross-channel handoff routes
+  deep_work_trigger_phrases: []   # Legacy Deep Work shortcut phrases
   history_backfill: true          # Prepend recent channel scrollback on mention (default: true)
   history_backfill_limit: 50      # Max messages to scan backwards (default: 50)
   channel_prompts: {}             # Per-channel ephemeral system prompts
@@ -420,6 +451,80 @@ discord:
 ```
 
 Useful for channels dedicated to bot interaction where threads would add unnecessary noise.
+
+#### `discord.channel_model_bindings`
+
+**Type:** list of mappings — **Default:** `[]`
+
+Bind a Discord parent channel or thread to a specific model/provider pair.
+
+```yaml
+discord:
+  channel_model_bindings:
+    - id: "1510042356487950376"
+      model: gpt-5.5
+      provider: openai-codex
+      base_url: https://chatgpt.com/backend-api/codex
+```
+
+Use this when one room should always run a different model than the rest of the gateway.
+
+Behavior:
+
+- Exact thread/channel ID matches win first.
+- If a message arrives inside a thread and that thread has no explicit binding, Hermes falls back to the parent channel ID.
+- Threads created by Discord handoff routes inherit from the target parent channel automatically, so you usually bind the parent channel, not each created thread.
+
+Each binding entry supports the same fields as the normal model config override surface:
+
+- `id` — Discord thread or channel ID to match.
+- `model` — model name to switch to.
+- `provider` — provider slug to use with that model.
+- `base_url` — optional provider base URL override.
+
+#### `discord.handoff_routes`
+
+**Type:** list of mappings — **Default:** `[]`
+
+Trigger-based cross-channel routing for Discord. A matching route creates a new thread under the configured destination parent channel, rewrites the task as a handoff message, and runs that destination thread under the target channel's model binding.
+
+```yaml
+discord:
+  handoff_routes:
+    - label: Deep Work
+      target_channel_id: "1510042356487950376"
+      trigger_phrases:
+        - push this to deep work
+        - push this to the deep work channel
+      auto_run_marker: "[AUTO_RUN_DEEP_WORK]"
+      thread_name_prefix: Deep Work
+```
+
+Recommended route shape:
+
+- Keep trigger phrases imperative and start-anchored.
+- Pair every route with a matching `channel_model_bindings` entry for the destination parent channel.
+- Use a stable `auto_run_marker` so the bot-authored follow-up can execute in the destination thread without recursing infinitely.
+
+Field meanings:
+
+- `label` — human-facing label included in injected handoff text and logs.
+- `target_channel_id` — destination parent channel where Hermes creates the routed thread.
+- `trigger_phrases` — phrases that activate the route.
+- `auto_run_marker` — internal marker used only for the bot-generated follow-up turn.
+- `thread_name_prefix` — prefix for the created thread title.
+
+#### `discord.deep_work_trigger_phrases`
+
+**Type:** string or list — **Default:** `[]`
+
+Legacy shortcut phrases for the built-in Deep Work route normalization. Prefer `handoff_routes` for new setups because it is explicit and supports multiple routes, labels, and markers.
+
+```yaml
+discord:
+  deep_work_trigger_phrases:
+    - push this to deep work
+```
 
 #### `discord.channel_prompts`
 
