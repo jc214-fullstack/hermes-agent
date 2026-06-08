@@ -13825,6 +13825,12 @@ def main():
     _add_portal_parser(subparsers)
 
     # =========================================================================
+    # loadout command — external Claude/Codex terminal loadout integration
+    # =========================================================================
+    from hermes_cli.loadout_cli import add_parser as _add_loadout_parser
+    _add_loadout_parser(subparsers)
+
+    # =========================================================================
     # kanban command — multi-profile collaboration board
     # =========================================================================
     from hermes_cli.kanban import build_parser as _build_kanban_parser

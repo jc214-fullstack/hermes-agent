@@ -75,6 +75,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes mcp` | Manage MCP server configurations and run Hermes as an MCP server. |
 | `hermes plugins` | Manage Hermes Agent plugins (install, enable, disable, remove). |
 | `hermes portal` | Nous Portal status, subscription link, and Tool Gateway routing. See [Tool Gateway](../user-guide/features/tool-gateway.md). |
+| `hermes loadout` | Resolve, apply, inspect, and launch Claude/Codex terminal loadouts from the external loadout repo. |
 | `hermes tools` | Configure enabled tools per platform. |
 | `hermes computer-use` | Install or check the cua-driver backend (macOS Computer Use). |
 | `hermes sessions` | Browse, export, prune, rename, and delete sessions. |
@@ -309,6 +310,46 @@ Inspect Nous Portal auth, Tool Gateway routing, and reach the subscription page.
 | `tools` | List every Tool Gateway partner (Firecrawl, FAL, OpenAI TTS, Browser Use, Modal) and which are routed via Nous. |
 
 For configuration of the gateway itself, see [Tool Gateway](../user-guide/features/tool-gateway.md). For the one-shot setup path, see `hermes setup --portal` above.
+
+## `hermes loadout`
+
+```bash
+hermes loadout [--repo /path/to/hermes-coding-terminal-load-out-system] [--json] <subcommand>
+```
+
+Drive the external terminal-loadout system Hermes uses for Claude Code and Codex launches. The command reads the repo-managed routing/materialization logic, can stage runtime homes before a gateway restart, and can smoke-test the launch contract without spawning a live session.
+
+Subcommands:
+
+| Subcommand | Description |
+|------------|-------------|
+| `status` | Show the active live-home manifest for `claude`, `codex`, or both runtimes. |
+| `resolve` | Resolve a natural-language request into a loadout name for a given runtime. |
+| `apply` | Materialize a loadout into an output directory or directly into the live runtime home. |
+| `launch` | Apply a live-home loadout, then launch the selected runtime. Use `--dry-run` to inspect the exact plan without spawning Claude/Codex. |
+
+Examples:
+
+```bash
+# Inspect the current live-home manifests
+hermes loadout status --json
+
+# Resolve which Claude loadout a request would use
+hermes loadout resolve --runtime claude --request "Use Claude Code to inspect this React UI" --json
+
+# Stage the codex runtime home before a gateway restart
+hermes loadout apply --runtime codex --request "Use Codex for repo analysis" --target-home --json
+
+# Validate the apply + launch contract without opening Codex
+hermes loadout launch codex --request "Use Codex to audit this repo" --dry-run --json
+```
+
+Operational notes:
+
+- The default repo path is `~/projects/hermes-coding-terminal-load-out-system`. Override it with `--repo` or `HERMES_LOADOUT_REPO` when needed.
+- `launch claude` currently supports only the default live home (`~/.claude`). Codex can use `--home` overrides.
+- For pre-restart prep, run `apply --target-home` first so the runtime homes and `hermes-loadout.json` manifests are already in place when the gateway comes back up.
+- After shipping loadout-related Hermes changes, restart the gateway with `hermes gateway restart`, then re-run `hermes loadout status --json` and one `launch ... --dry-run --json` command as the smoke test.
 
 ## `hermes whatsapp`
 
