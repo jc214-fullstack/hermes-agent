@@ -433,6 +433,81 @@ class TestLoadGatewayConfig:
         assert os.getenv("DISCORD_HISTORY_BACKFILL") == "true"
         assert os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT") == "17"
 
+    def test_bridges_discord_channel_model_bindings_and_handoff_routes_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  channel_model_bindings:\n"
+            "    - id: 123\n"
+            "      model: gpt-5.4\n"
+            "      provider: openai-codex\n"
+            "      base_url: https://chatgpt.com/backend-api/codex\n"
+            "    - id: parent-chan\n"
+            "      model: claude-sonnet\n"
+            "      provider: openrouter\n"
+            "  handoff_routes:\n"
+            "    - label: Deep Work\n"
+            "      target_channel_id: 999\n"
+            "      trigger_phrases:\n"
+            "        - Push this to deep work\n"
+            "        - Ship this\n"
+            "      auto_run_marker: '[AUTO_RUN_DEEP_WORK]'\n"
+            "      thread_name_prefix: Deep Work\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.DISCORD].extra["channel_model_bindings"] == [
+            {
+                "id": "123",
+                "model": "gpt-5.4",
+                "provider": "openai-codex",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+            },
+            {
+                "id": "parent-chan",
+                "model": "claude-sonnet",
+                "provider": "openrouter",
+            },
+        ]
+        assert config.platforms[Platform.DISCORD].extra["handoff_routes"] == [
+            {
+                "label": "Deep Work",
+                "target_channel_id": "999",
+                "trigger_phrases": ["Push this to deep work", "Ship this"],
+                "auto_run_marker": "[AUTO_RUN_DEEP_WORK]",
+                "thread_name_prefix": "Deep Work",
+            }
+        ]
+
+    def test_bridges_discord_deep_work_settings_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  deep_work_channel_id: 777\n"
+            "  deep_work_trigger_phrases:\n"
+            "    - Push this to deep work\n"
+            "    - Continue in deep work\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.DISCORD].extra["deep_work_channel_id"] == "777"
+        assert config.platforms[Platform.DISCORD].extra["deep_work_trigger_phrases"] == [
+            "Push this to deep work",
+            "Continue in deep work",
+        ]
+
     def test_bridges_telegram_channel_prompts_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

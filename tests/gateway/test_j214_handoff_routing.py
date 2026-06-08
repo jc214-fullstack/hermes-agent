@@ -88,6 +88,30 @@ def test_channel_model_binding_inherits_from_parent_thread():
     assert binding["provider"] == "openai-codex"
 
 
+def test_channel_model_binding_prefers_exact_child_binding_over_parent():
+    runner = _make_runner_with_binding()
+    runner.config.platforms[Platform.DISCORD].extra["channel_model_bindings"].append(
+        {
+            "id": "thread-1",
+            "model": "gpt-5.5",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_mode": "chat_completions",
+        }
+    )
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        user_id="u1",
+        chat_id="thread-1",
+        parent_chat_id="parent-chan",
+        chat_type="thread",
+    )
+    binding = runner._channel_model_binding_for_source(source)
+    assert binding is not None
+    assert binding["model"] == "gpt-5.5"
+    assert binding["provider"] == "openrouter"
+
+
 def test_resolve_session_runtime_applies_channel_binding(monkeypatch):
     runner = _make_runner_with_binding()
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda cfg=None: "anthropic/claude")
@@ -113,6 +137,47 @@ def test_resolve_session_runtime_applies_channel_binding(monkeypatch):
     assert runtime_kwargs["provider"] == "openai-codex"
     assert runtime_kwargs["base_url"] == "https://chatgpt.com/backend-api/codex"
     assert runtime_kwargs["api_mode"] == "codex_responses"
+
+
+def test_session_override_beats_channel_model_binding(monkeypatch):
+    runner = _make_runner_with_binding()
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda cfg=None: "anthropic/claude")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_key": "router-key",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        user_id="u1",
+        chat_id="thread-1",
+        parent_chat_id="parent-chan",
+        chat_type="thread",
+    )
+    session_key = build_session_key(source)
+    runner._session_model_overrides[session_key] = {
+        "model": "gpt-5.5",
+        "provider": "openrouter",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_mode": "chat_completions",
+        "api_key": "router-key",
+    }
+
+    model, runtime_kwargs = runner._resolve_session_agent_runtime(
+        source=source,
+        session_key=session_key,
+        user_config={},
+    )
+
+    assert model == "gpt-5.5"
+    assert runtime_kwargs["provider"] == "openrouter"
+    assert runtime_kwargs["base_url"] == "https://openrouter.ai/api/v1"
+    assert runtime_kwargs["api_mode"] == "chat_completions"
 
 
 def _make_reset_runner():

@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import PlatformConfig, Platform, load_gateway_config
 
 
 def _ensure_discord_mock():
@@ -114,6 +114,8 @@ def adapter(monkeypatch):
         "DISCORD_HISTORY_BACKFILL",
         "DISCORD_HISTORY_BACKFILL_LIMIT",
         "DISCORD_ALLOW_BOTS",
+        "DISCORD_DEEP_WORK_CHANNEL_ID",
+        "DISCORD_DEEP_WORK_TRIGGER_PHRASES",
     ):
         monkeypatch.delenv(_var, raising=False)
 
@@ -384,6 +386,76 @@ async def test_discord_auto_thread_enabled_by_default(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_discord_free_response_channel_skips_auto_thread_by_default(adapter, monkeypatch):
+    """Free-response channels stay in-channel unless explicitly opted back into threading."""
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "123")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_AUTO_THREAD_CHANNELS", raising=False)
+
+    adapter._auto_create_thread = AsyncMock()
+
+    message = make_message(channel=FakeTextChannel(channel_id=123), content="hello")
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "group"
+    assert event.source.chat_id == "123"
+
+
+@pytest.mark.asyncio
+async def test_discord_free_response_channel_can_opt_back_into_auto_thread(adapter, monkeypatch):
+    """Selected free-response channels can still auto-thread without requiring mentions."""
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "123")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_AUTO_THREAD_CHANNELS", "123")
+
+    fake_thread = FakeThread(channel_id=999, name="auto-thread")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+
+    message = make_message(channel=FakeTextChannel(channel_id=123), content="hello")
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "999"
+
+
+def test_load_gateway_config_bridges_discord_free_response_auto_thread_channels(monkeypatch, tmp_path):
+    """Gateway config should expose Discord free-response auto-thread channels in config.extra."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+    for key in (
+        "DISCORD_FREE_RESPONSE_CHANNELS",
+        "DISCORD_FREE_RESPONSE_AUTO_THREAD_CHANNELS",
+        "DISCORD_NO_THREAD_CHANNELS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    (tmp_path / "config.yaml").write_text(
+        """
+discord:
+  free_response_channels: 123
+  free_response_auto_thread_channels: 123
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    config = load_gateway_config()
+    discord_cfg = config.platforms[Platform.DISCORD]
+
+    assert discord_cfg.extra["free_response_channels"] == 123
+    assert discord_cfg.extra["free_response_auto_thread_channels"] == 123
+
+
+@pytest.mark.asyncio
 async def test_discord_reply_message_skips_auto_thread(adapter, monkeypatch):
     """Quote-replies should stay in-channel instead of trying to create a thread."""
     monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
@@ -636,6 +708,102 @@ async def test_discord_thread_require_mention_via_config_extra(adapter, monkeypa
 
     adapter.handle_message.assert_not_awaited()
 
+
+@pytest.mark.asyncio
+async def test_discord_deep_work_trigger_routes_into_target_thread(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    adapter.config.extra["deep_work_channel_id"] = "999"
+    adapter.config.extra["deep_work_trigger_phrases"] = ["push this to deep work"]
+    adapter.create_handoff_thread = AsyncMock(return_value="1001")
+    routed_thread = FakeThread(channel_id=1001, name="Deep Work — task", parent=FakeTextChannel(channel_id=999, name="deep-work"))
+    adapter._client.get_channel = MagicMock(return_value=routed_thread)
+    adapter._client.fetch_channel = AsyncMock(return_value=routed_thread)
+
+    message = make_message(channel=FakeTextChannel(channel_id=123), content="push this to deep work: finish the parser")
+    await adapter._handle_message(message)
+
+    adapter.create_handoff_thread.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "1001"
+    assert event.source.parent_chat_id == "999"
+    assert "[Deep Work handoff from channel 123 message 123 by Jezza]" in event.text
+    assert event.text.endswith("finish the parser")
+
+
+@pytest.mark.asyncio
+async def test_discord_handoff_trigger_must_start_message(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    adapter.config.extra["deep_work_channel_id"] = "999"
+    adapter.config.extra["deep_work_trigger_phrases"] = ["push this to deep work"]
+    adapter.create_handoff_thread = AsyncMock()
+
+    message = make_message(channel=FakeTextChannel(channel_id=123), content="please push this to deep work when you can")
+    await adapter._handle_message(message)
+
+    adapter.create_handoff_thread.assert_not_awaited()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "please push this to deep work when you can"
+    assert event.source.chat_id == "123"
+
+
+@pytest.mark.asyncio
+async def test_discord_auto_run_marker_does_not_recurse_inside_target_route(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    adapter.config.extra["handoff_routes"] = [
+        {
+            "label": "Deep Work",
+            "target_channel_id": "999",
+            "trigger_phrases": ["push this to deep work"],
+            "auto_run_marker": "[AUTO_RUN_DEEP_WORK]",
+            "thread_name_prefix": "Deep Work",
+        }
+    ]
+    adapter.create_handoff_thread = AsyncMock()
+
+    target_parent = FakeTextChannel(channel_id=999, name="deep-work")
+    message = make_message(
+        channel=FakeThread(channel_id=1001, name="Deep Work — task", parent=target_parent),
+        content="[AUTO_RUN_DEEP_WORK] continue from there",
+    )
+    await adapter._handle_message(message)
+
+    adapter.create_handoff_thread.assert_not_awaited()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "continue from there"
+    assert event.source.chat_id == "1001"
+    assert event.source.parent_chat_id == "999"
+
+
+@pytest.mark.asyncio
+async def test_discord_generic_handoff_route_uses_configured_marker_and_label(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    adapter.config.extra["handoff_routes"] = [
+        {
+            "label": "Research",
+            "target_channel_id": "555",
+            "trigger_phrases": ["route this to research"],
+            "auto_run_marker": "[AUTO_RUN_RESEARCH]",
+            "thread_name_prefix": "Research",
+        }
+    ]
+    adapter.create_handoff_thread = AsyncMock(return_value="2002")
+    routed_thread = FakeThread(channel_id=2002, name="Research — task", parent=FakeTextChannel(channel_id=555, name="research"))
+    adapter._client.get_channel = MagicMock(return_value=routed_thread)
+    adapter._client.fetch_channel = AsyncMock(return_value=routed_thread)
+
+    message = make_message(channel=FakeTextChannel(channel_id=321), content="route this to research: summarize the repo")
+    await adapter._handle_message(message)
+
+    adapter.create_handoff_thread.assert_awaited_once_with("555", "Research — summarize the repo")
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "2002"
+    assert event.source.parent_chat_id == "555"
+    assert event.text.startswith("[Research handoff from channel 321 message 123 by Jezza]")
+    assert event.text.endswith("summarize the repo")
 
 
 @pytest.mark.asyncio
