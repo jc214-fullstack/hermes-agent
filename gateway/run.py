@@ -2428,6 +2428,63 @@ class GatewayRunner:
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
 
+    def _channel_model_binding_for_source(self, source: Optional[SessionSource]) -> Optional[dict]:
+        """Return the most specific channel model binding for a source."""
+        if source is None or not getattr(source, "platform", None):
+            return None
+        config = getattr(self, "config", None)
+        platforms = getattr(config, "platforms", None) if config is not None else None
+        platform_cfg = platforms.get(source.platform) if platforms else None
+        extra = getattr(platform_cfg, "extra", None) if platform_cfg is not None else None
+        bindings = extra.get("channel_model_bindings") if isinstance(extra, dict) else None
+        if not isinstance(bindings, list) or not bindings:
+            return None
+
+        direct_ids: list[str] = []
+        for attr in ("topic_id", "chat_id"):
+            value = str(getattr(source, attr, "") or "").strip()
+            if value:
+                direct_ids.append(value)
+        parent_id = str(getattr(source, "parent_chat_id", "") or "").strip()
+
+        normalized: dict[str, dict] = {}
+        for entry in bindings:
+            if not isinstance(entry, dict):
+                continue
+            entry_id = str(entry.get("id", "") or "").strip()
+            if entry_id:
+                normalized[entry_id] = entry
+
+        for entry_id in direct_ids:
+            if entry_id in normalized:
+                return normalized[entry_id]
+        if parent_id and parent_id in normalized:
+            return normalized[parent_id]
+        return None
+
+    def _apply_channel_model_binding(
+        self,
+        source: Optional[SessionSource],
+        model: str,
+        runtime_kwargs: dict,
+    ) -> tuple[str, dict]:
+        """Apply persisted channel defaults to a freshly resolved session runtime."""
+        binding = self._channel_model_binding_for_source(source)
+        if not binding:
+            return model, runtime_kwargs
+
+        bound_model = str(binding.get("model") or "").strip() or model
+        runtime = dict(runtime_kwargs)
+        if binding.get("provider"):
+            runtime["provider"] = binding.get("provider")
+        if binding.get("base_url"):
+            runtime["base_url"] = binding.get("base_url")
+        if binding.get("api_key"):
+            runtime["api_key"] = binding.get("api_key")
+        if binding.get("api_mode"):
+            runtime["api_mode"] = binding.get("api_mode")
+        return bound_model, runtime
+
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
         if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
@@ -2678,6 +2735,7 @@ class GatewayRunner:
                 runtime_model,
             )
             model = runtime_model
+        model, runtime_kwargs = self._apply_channel_model_binding(source, model, runtime_kwargs)
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
@@ -5112,10 +5170,34 @@ class GatewayRunner:
 
                 for key, entry in _expired_entries:
                     try:
+                        _parts = key.split(":")
+                        _platform = _parts[2] if len(_parts) > 2 else ""
+                        _cached_agent = None
+                        _cached_messages = []
+                        _cache_lock = getattr(self, "_agent_cache_lock", None)
+                        if _cache_lock is not None:
+                            with _cache_lock:
+                                _cached = self._agent_cache.get(key)
+                                _cached_agent = _cached[0] if isinstance(_cached, tuple) else _cached if _cached else None
+                        # Fall back to _running_agents in case the agent is
+                        # still mid-turn when the expiry fires.
+                        if _cached_agent is None:
+                            _cached_agent = self._running_agents.get(key)
+                        if _cached_agent and _cached_agent is not _AGENT_PENDING_SENTINEL:
+                            _cached_messages = list(getattr(_cached_agent, "conversation_history", []) or [])
+                        try:
+                            from agent.session_lifecycle_writeback import finalize_session as _finalize_session_writeback
+                            _finalize_session_writeback(
+                                agent=_cached_agent if _cached_agent is not _AGENT_PENDING_SENTINEL else None,
+                                session_id=entry.session_id,
+                                boundary_reason="session_expired",
+                                messages=_cached_messages,
+                                metadata={"session_key": key},
+                            )
+                        except Exception:
+                            pass
                         try:
                             from hermes_cli.plugins import invoke_hook as _invoke_hook
-                            _parts = key.split(":")
-                            _platform = _parts[2] if len(_parts) > 2 else ""
                             _invoke_hook(
                                 "on_session_finalize",
                                 session_id=entry.session_id,
@@ -5127,16 +5209,6 @@ class GatewayRunner:
                         # Shut down memory provider and close tool resources
                         # on the cached agent.  Idle agents live in
                         # _agent_cache (not _running_agents), so look there.
-                        _cached_agent = None
-                        _cache_lock = getattr(self, "_agent_cache_lock", None)
-                        if _cache_lock is not None:
-                            with _cache_lock:
-                                _cached = self._agent_cache.get(key)
-                                _cached_agent = _cached[0] if isinstance(_cached, tuple) else _cached if _cached else None
-                        # Fall back to _running_agents in case the agent is
-                        # still mid-turn when the expiry fires.
-                        if _cached_agent is None:
-                            _cached_agent = self._running_agents.get(key)
                         if _cached_agent and _cached_agent is not _AGENT_PENDING_SENTINEL:
                             self._cleanup_agent_resources(_cached_agent)
                         # Drop the cache entry so the AIAgent (and its LLM
@@ -9800,6 +9872,18 @@ class GatewayRunner:
                     "Auto-resetting session %s after compression exhaustion.",
                     session_entry.session_id,
                 )
+                try:
+                    from agent.session_lifecycle_writeback import finalize_session as _finalize_session_writeback
+                    _finalize_session_writeback(
+                        agent=agent,
+                        session_id=session_entry.session_id,
+                        boundary_reason="compression_exhaustion",
+                        messages=agent_messages,
+                        source_override=source.to_dict(),
+                        metadata={"compression_exhausted": True},
+                    )
+                except Exception:
+                    pass
                 self.session_store.reset_session(session_key)
                 self._evict_cached_agent(session_key)
                 self._session_model_overrides.pop(session_key, None)
@@ -10042,7 +10126,7 @@ class GatewayRunner:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, source: Optional[SessionSource] = None, session_key: Optional[str] = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
@@ -10079,6 +10163,21 @@ class GatewayRunner:
                     custom_provs = data.get("custom_providers")
         except Exception:
             pass
+
+        if source is not None:
+            try:
+                resolved_model, resolved_runtime = self._resolve_session_agent_runtime(
+                    source=source,
+                    session_key=session_key or self._session_key_for_source(source),
+                    user_config=data or {},
+                )
+                model = resolved_model or model
+                if isinstance(resolved_runtime, dict):
+                    provider = resolved_runtime.get("provider") or provider
+                    base_url = resolved_runtime.get("base_url") or base_url
+                    api_key = resolved_runtime.get("api_key") or api_key
+            except Exception:
+                pass
 
         # Also check custom_providers for context_length when top-level model.context_length is not set
         if config_context_length is None and data:
@@ -10178,6 +10277,8 @@ class GatewayRunner:
         # Snapshot the old entry so on_session_finalize can report the
         # expiring session id before reset_session() rotates it.
         old_entry = self.session_store._entries.get(session_key)
+        _old_agent = None
+        _old_messages = []
 
         # Close tool resources on the old agent (terminal sandboxes, browser
         # daemons, background processes) before evicting from cache.
@@ -10188,6 +10289,7 @@ class GatewayRunner:
                 _cached = self._agent_cache.get(session_key)
                 _old_agent = _cached[0] if isinstance(_cached, tuple) else _cached if _cached else None
             if _old_agent is not None:
+                _old_messages = list(getattr(_old_agent, "conversation_history", []) or [])
                 self._cleanup_agent_resources(_old_agent)
         self._evict_cached_agent(session_key)
 
@@ -10226,6 +10328,18 @@ class GatewayRunner:
         self._clear_session_boundary_security_state(session_key)
 
         _old_sid = old_entry.session_id if old_entry else None
+        try:
+            from agent.session_lifecycle_writeback import finalize_session as _finalize_session_writeback
+            _finalize_session_writeback(
+                agent=_old_agent,
+                session_id=_old_sid or "",
+                boundary_reason="new_session",
+                messages=_old_messages,
+                source_override=source.to_dict(),
+                metadata={"next_session_id": new_entry.session_id if new_entry else None},
+            )
+        except Exception:
+            pass
 
         # Fire plugin on_session_finalize hook (session boundary)
         try:
@@ -10257,7 +10371,7 @@ class GatewayRunner:
 
         # Resolve session config info to surface to the user
         try:
-            session_info = self._format_session_info()
+            session_info = self._format_session_info(source=source, session_key=session_key)
         except Exception:
             session_info = ""
 
@@ -10301,6 +10415,22 @@ class GatewayRunner:
                 self._record_telegram_topic_binding(source, new_entry)
             except Exception:
                 logger.debug("Failed to rebind Telegram topic after /new", exc_info=True)
+
+        if new_entry is not None and self._session_db is not None:
+            try:
+                route_model, route_runtime = self._resolve_session_agent_runtime(
+                    source=source,
+                    session_key=new_entry.session_key,
+                    user_config=_load_gateway_config(),
+                )
+                self._session_db.update_session_route_metadata(
+                    new_entry.session_id,
+                    model=route_model or None,
+                    billing_provider=route_runtime.get("provider") or None,
+                    billing_base_url=route_runtime.get("base_url") or None,
+                )
+            except Exception:
+                logger.debug("Failed to persist route metadata for fresh /new session", exc_info=True)
 
         # Fire plugin on_session_reset hook (new session guaranteed to exist)
         try:
@@ -11135,8 +11265,36 @@ class GatewayRunner:
 
         raw_args = event.get_command_args().strip()
 
+        import shlex
+        channel_bind = False
+        channel_bind_target: Optional[str] = None
+        filtered_tokens: list[str] = []
+        try:
+            raw_tokens = shlex.split(raw_args)
+        except Exception:
+            raw_tokens = raw_args.split()
+        i = 0
+        while i < len(raw_tokens):
+            tok = raw_tokens[i]
+            if tok == "--channel":
+                channel_bind = True
+                if i + 1 < len(raw_tokens) and not raw_tokens[i + 1].startswith("--"):
+                    channel_bind_target = raw_tokens[i + 1].strip()
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if tok.startswith("--channel="):
+                channel_bind = True
+                channel_bind_target = tok.split("=", 1)[1].strip() or None
+                i += 1
+                continue
+            filtered_tokens.append(tok)
+            i += 1
+        filtered_args = " ".join(filtered_tokens).strip()
+
         # Parse --provider, --global, and --refresh flags
-        model_input, explicit_provider, persist_global, force_refresh = parse_model_flags(raw_args)
+        model_input, explicit_provider, persist_global, force_refresh = parse_model_flags(filtered_args)
 
         # --refresh: bust the disk cache so the picker shows live data.
         if force_refresh:
@@ -11440,33 +11598,86 @@ class GatewayRunner:
         # override rather than relying on cache signature mismatch detection.
         self._evict_cached_agent(session_key)
 
-        # Persist to config if --global
-        if persist_global:
+        persisted_channel_id: Optional[str] = None
+        if persist_global or channel_bind:
             try:
                 if config_path.exists():
                     with open(config_path, encoding="utf-8") as f:
                         cfg = yaml.safe_load(f) or {}
                 else:
                     cfg = {}
-                # Coerce scalar/None ``model:`` into a dict before mutation —
-                # otherwise ``cfg.setdefault("model", {})`` returns the existing
-                # scalar and the next assignment raises
-                # ``TypeError: 'str' object does not support item assignment``.
-                # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
-                # string) instead of the proper nested ``model: {default: ...}``.
-                raw_model = cfg.get("model")
-                if isinstance(raw_model, dict):
-                    model_cfg = raw_model
-                elif isinstance(raw_model, str) and raw_model.strip():
-                    model_cfg = {"default": raw_model.strip()}
-                    cfg["model"] = model_cfg
-                else:
-                    model_cfg = {}
-                    cfg["model"] = model_cfg
-                model_cfg["default"] = result.new_model
-                model_cfg["provider"] = result.target_provider
-                if result.base_url:
-                    model_cfg["base_url"] = result.base_url
+
+                if persist_global:
+                    raw_model = cfg.get("model")
+                    if isinstance(raw_model, dict):
+                        model_cfg = raw_model
+                    elif isinstance(raw_model, str) and raw_model.strip():
+                        model_cfg = {"default": raw_model.strip()}
+                        cfg["model"] = model_cfg
+                    else:
+                        model_cfg = {}
+                        cfg["model"] = model_cfg
+                    model_cfg["default"] = result.new_model
+                    model_cfg["provider"] = result.target_provider
+                    if result.base_url:
+                        model_cfg["base_url"] = result.base_url
+
+                if channel_bind:
+                    platform_key = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+                    platform_cfg = cfg.get(platform_key)
+                    if not isinstance(platform_cfg, dict):
+                        platform_cfg = {}
+                        cfg[platform_key] = platform_cfg
+                    bindings = platform_cfg.get("channel_model_bindings")
+                    if not isinstance(bindings, list):
+                        bindings = []
+                        platform_cfg["channel_model_bindings"] = bindings
+                    target_id = (channel_bind_target or "").strip() or str(getattr(source, "parent_chat_id", "") or "").strip() or str(getattr(source, "chat_id", "") or "").strip()
+                    if target_id:
+                        persisted_channel_id = target_id
+                        entry = {
+                            "id": target_id,
+                            "model": result.new_model,
+                            "provider": result.target_provider,
+                        }
+                        if result.base_url:
+                            entry["base_url"] = result.base_url
+                        if result.api_mode:
+                            entry["api_mode"] = result.api_mode
+                        updated = False
+                        for idx, existing in enumerate(bindings):
+                            if isinstance(existing, dict) and str(existing.get("id", "")) == target_id:
+                                merged = dict(existing)
+                                merged.update(entry)
+                                bindings[idx] = merged
+                                updated = True
+                                break
+                        if not updated:
+                            bindings.append(entry)
+                        try:
+                            cfg_platform = self.config.platforms.get(source.platform)
+                            extra = getattr(cfg_platform, "extra", None) if cfg_platform is not None else None
+                            if not isinstance(extra, dict):
+                                extra = {}
+                                if cfg_platform is not None:
+                                    cfg_platform.extra = extra
+                            live_bindings = extra.get("channel_model_bindings")
+                            if not isinstance(live_bindings, list):
+                                live_bindings = []
+                                extra["channel_model_bindings"] = live_bindings
+                            live_updated = False
+                            for idx, existing in enumerate(live_bindings):
+                                if isinstance(existing, dict) and str(existing.get("id", "")) == target_id:
+                                    merged = dict(existing)
+                                    merged.update(entry)
+                                    live_bindings[idx] = merged
+                                    live_updated = True
+                                    break
+                            if not live_updated:
+                                live_bindings.append(dict(entry))
+                        except Exception:
+                            logger.debug("Failed applying in-memory channel binding", exc_info=True)
+
                 from hermes_cli.config import save_config
                 save_config(cfg)
             except Exception as e:
@@ -11524,6 +11735,12 @@ class GatewayRunner:
             lines.append(t("gateway.model.saved_global"))
         else:
             lines.append(t("gateway.model.session_only_hint"))
+
+        if channel_bind:
+            if persisted_channel_id:
+                lines.append(f"✓ Saved channel default for `{persisted_channel_id}`. Use /new to start a fresh session on this route.")
+            else:
+                lines.append("⚠️ Could not determine a channel id to bind. Use `--channel <id>` explicitly.")
 
         return "\n".join(lines)
 

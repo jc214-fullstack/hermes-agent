@@ -890,6 +890,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["allowed_topics"] = platform_cfg["allowed_topics"]
                 if "free_response_channels" in platform_cfg:
                     bridged["free_response_channels"] = platform_cfg["free_response_channels"]
+                if plat == Platform.DISCORD and "free_response_auto_thread_channels" in platform_cfg:
+                    bridged["free_response_auto_thread_channels"] = platform_cfg["free_response_auto_thread_channels"]
                 if "mention_patterns" in platform_cfg:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
                 if "exclusive_bot_mentions" in platform_cfg:
@@ -920,6 +922,39 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = {str(k): v for k, v in channel_prompts.items()}
                     else:
                         bridged["channel_prompts"] = channel_prompts
+                if plat in {Platform.DISCORD, Platform.SLACK} and "channel_model_bindings" in platform_cfg:
+                    bindings = platform_cfg["channel_model_bindings"]
+                    if isinstance(bindings, list):
+                        normalized = []
+                        for entry in bindings:
+                            if not isinstance(entry, dict):
+                                continue
+                            item = dict(entry)
+                            if "id" in item:
+                                item["id"] = str(item["id"])
+                            normalized.append(item)
+                        bridged["channel_model_bindings"] = normalized
+                    else:
+                        bridged["channel_model_bindings"] = bindings
+                if plat == Platform.DISCORD and "handoff_routes" in platform_cfg:
+                    routes = platform_cfg["handoff_routes"]
+                    if isinstance(routes, list):
+                        normalized_routes = []
+                        for entry in routes:
+                            if not isinstance(entry, dict):
+                                continue
+                            item = dict(entry)
+                            for key in ("target_channel_id", "target_id", "channel_id"):
+                                if key in item:
+                                    item[key] = str(item[key])
+                            normalized_routes.append(item)
+                        bridged["handoff_routes"] = normalized_routes
+                    else:
+                        bridged["handoff_routes"] = routes
+                if plat == Platform.DISCORD and "deep_work_channel_id" in platform_cfg:
+                    bridged["deep_work_channel_id"] = str(platform_cfg["deep_work_channel_id"])
+                if plat == Platform.DISCORD and "deep_work_trigger_phrases" in platform_cfg:
+                    bridged["deep_work_trigger_phrases"] = platform_cfg["deep_work_trigger_phrases"]
                 if "gateway_restart_notification" in platform_cfg:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
                 enabled_was_explicit = _cfg_toplevel and "enabled" in platform_cfg

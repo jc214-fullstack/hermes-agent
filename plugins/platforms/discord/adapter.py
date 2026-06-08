@@ -771,9 +771,25 @@ class DiscordAdapter(BasePlatformAdapter):
                 if adapter_self._dedup.is_duplicate(str(message.id)):
                     return
 
-                # Always ignore our own messages
-                if message.author == self._client.user:
-                    return
+                # Ignore our own messages unless this is an explicit handoff
+                # transport message carrying an allowed auto-run marker.
+                own_auto_run_handoff = False
+                self_user = getattr(self._client, "user", None)
+                author_is_self = bool(
+                    self_user is not None
+                    and (
+                        message.author == self_user
+                        or str(getattr(message.author, "id", "")) == str(getattr(self_user, "id", ""))
+                    )
+                )
+                if author_is_self:
+                    own_content = (getattr(message, "content", "") or "").strip()
+                    own_auto_run_handoff = any(
+                        marker in own_content
+                        for marker in adapter_self._discord_handoff_auto_run_markers()
+                    )
+                    if not own_auto_run_handoff:
+                        return
 
                 # Ignore Discord system messages (thread renames, pins, member joins, etc.)
                 # Allow both default and reply types — replies have a distinct MessageType.
@@ -787,7 +803,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Must run BEFORE the user allowlist check so that bots
                 # permitted by DISCORD_ALLOW_BOTS are not rejected for
                 # not being in DISCORD_ALLOWED_USERS (fixes #4466).
-                if getattr(message.author, "bot", False):
+                if getattr(message.author, "bot", False) and not own_auto_run_handoff:
                     allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
                     if allow_bots == "none":
                         return
@@ -3907,6 +3923,24 @@ class DiscordAdapter(BasePlatformAdapter):
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
 
+    def _discord_free_response_auto_thread_channels(self) -> set:
+        """Return free-response channel IDs that should still auto-thread.
+
+        By default, free-response channels skip auto-thread creation so a
+        dedicated always-on home channel can stay in-channel. Some workflows
+        want the opposite: no repeated @mentions, but still one thread per root
+        message. This allowlist restores auto-threading for those channels.
+        """
+        raw = self.config.extra.get("free_response_auto_thread_channels")
+        if raw is None:
+            raw = os.getenv("DISCORD_FREE_RESPONSE_AUTO_THREAD_CHANNELS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        s = str(raw).strip() if raw is not None else ""
+        if s:
+            return {part.strip() for part in s.split(",") if part.strip()}
+        return set()
+
     def _discord_thread_require_mention(self) -> bool:
         """Return whether thread participation requires @mention to follow up.
 
@@ -3954,6 +3988,81 @@ class DiscordAdapter(BasePlatformAdapter):
             return int(raw)
         except (ValueError, TypeError):
             return 50
+
+    def _discord_deep_work_channel_id(self) -> str:
+        configured = self.config.extra.get("deep_work_channel_id")
+        if configured is None:
+            configured = os.getenv("DISCORD_DEEP_WORK_CHANNEL_ID", "")
+        return str(configured).strip() if configured is not None else ""
+
+    def _discord_deep_work_trigger_phrases(self) -> list[str]:
+        configured = self.config.extra.get("deep_work_trigger_phrases")
+        if configured is None:
+            configured = os.getenv("DISCORD_DEEP_WORK_TRIGGER_PHRASES", "")
+        phrases = self._normalize_handoff_trigger_phrases(configured)
+        return phrases or ["push this to deep work"]
+
+    def _discord_handoff_routes(self) -> list[dict[str, Any]]:
+        routes: list[dict[str, Any]] = []
+        raw_routes = self.config.extra.get("handoff_routes")
+        if isinstance(raw_routes, list):
+            for raw in raw_routes:
+                if not isinstance(raw, dict):
+                    continue
+                item = dict(raw)
+                target = str(item.get("target_channel_id") or item.get("target_id") or item.get("channel_id") or "").strip()
+                if not target:
+                    continue
+                item["target_channel_id"] = target
+                routes.append(item)
+        deep_work_target = self._discord_deep_work_channel_id()
+        if deep_work_target and not any(str(route.get("target_channel_id") or "") == deep_work_target for route in routes):
+            routes.append({
+                "label": "Deep Work",
+                "target_channel_id": deep_work_target,
+                "trigger_phrases": self._discord_deep_work_trigger_phrases(),
+                "auto_run_marker": "[AUTO_RUN_DEEP_WORK]",
+                "thread_name_prefix": "Deep Work",
+            })
+        return routes
+
+    def _discord_handoff_auto_run_markers(self) -> set[str]:
+        markers = {"[AUTO_RUN_DEEP_WORK]"}
+        for route in self._discord_handoff_routes():
+            marker = str(route.get("auto_run_marker") or "").strip()
+            if marker:
+                markers.add(marker)
+        return markers
+
+    @staticmethod
+    def _normalize_handoff_trigger_phrases(raw_phrases: Any) -> list[str]:
+        if isinstance(raw_phrases, list):
+            candidates = [str(item).strip() for item in raw_phrases if str(item).strip()]
+        else:
+            text = str(raw_phrases or "").strip()
+            candidates = [part.strip() for part in text.split(",") if part.strip()] if text else []
+        seen: set[str] = set()
+        phrases: list[str] = []
+        for phrase in candidates:
+            normalized = " ".join(phrase.lower().split())
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                phrases.append(normalized)
+        return phrases
+
+    @staticmethod
+    def _match_deep_work_trigger(text: str, phrases: list[str]) -> str | None:
+        normalized = " ".join((text or "").strip().lower().split())
+        for phrase in phrases:
+            if normalized == phrase or normalized.startswith(f"{phrase} ") or normalized.startswith(f"{phrase}:"):
+                return phrase
+        return None
+
+    @staticmethod
+    def _strip_deep_work_trigger(text: str, trigger: str) -> str:
+        pattern = re.compile(rf"^\s*{re.escape(trigger)}\b", re.IGNORECASE)
+        cleaned = pattern.sub("", text or "", count=1).strip()
+        return cleaned.lstrip("-:;,. ").rstrip()
 
     async def _fetch_channel_context(
         self,
@@ -4712,6 +4821,7 @@ class DiscordAdapter(BasePlatformAdapter):
         #   discord.ignored_channels: Channel IDs where bot NEVER responds (even when mentioned)
         #   discord.allowed_channels: If set, bot ONLY responds in these channels (whitelist)
         #   discord.no_thread_channels: Channel IDs where bot responds directly without creating thread
+        #   discord.free_response_auto_thread_channels: Free-response channels that should still auto-thread
         #   discord.auto_thread: Auto-create thread on @mention in channels (default: true)
 
         thread_id = None
@@ -4728,6 +4838,8 @@ class DiscordAdapter(BasePlatformAdapter):
         raw_content = message.content.strip()
         normalized_content = raw_content
         mention_prefix = False
+        channel_ids: set[str] = set()
+        is_free_channel = False
 
         snapshot_attachments = []
         if hasattr(message, "message_snapshots") and message.message_snapshots:
@@ -4744,6 +4856,26 @@ class DiscordAdapter(BasePlatformAdapter):
             normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
             normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
             message.content = normalized_content
+
+        selected_route = None
+        auto_run_marker = None
+        for route in self._discord_handoff_routes():
+            marker = str(route.get("auto_run_marker") or "").strip()
+            if marker and marker in normalized_content:
+                selected_route = route
+                auto_run_marker = marker
+                normalized_content = normalized_content.replace(marker, "", 1).strip()
+                normalized_content = normalized_content.lstrip("-:;,. ").rstrip()
+                message.content = normalized_content
+                break
+            matched = self._match_deep_work_trigger(
+                normalized_content,
+                self._normalize_handoff_trigger_phrases(route.get("trigger_phrases")),
+            )
+            if matched:
+                selected_route = route
+                auto_run_marker = matched
+                break
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
@@ -4799,10 +4931,45 @@ class DiscordAdapter(BasePlatformAdapter):
         # Messages already inside threads or DMs are unaffected.
         # no_thread_channels: channels where bot responds directly without thread.
         auto_threaded_channel = None
+        if selected_route and auto_run_marker:
+            target_parent_id = str(selected_route.get("target_channel_id") or "").strip()
+            source_channel_id = str(getattr(message.channel, "id", "") or "")
+            in_target_channel = bool(target_parent_id and (source_channel_id == target_parent_id or str(parent_channel_id or "") == target_parent_id))
+            if target_parent_id and not in_target_channel:
+                task_text = normalized_content
+                if auto_run_marker not in self._discord_handoff_auto_run_markers():
+                    task_text = self._strip_deep_work_trigger(normalized_content, auto_run_marker)
+                if not task_text:
+                    task_text = "Continue this task in Deep Work. Ask one clarification question if needed and proceed."
+                thread_name_prefix = str(selected_route.get("thread_name_prefix") or selected_route.get("label") or "Deep Work").strip() or "Deep Work"
+                thread_name = f"{thread_name_prefix} — {task_text[:56].strip() or 'handoff'}"[:80]
+                routed_thread_id = await self.create_handoff_thread(target_parent_id, thread_name)
+                if routed_thread_id:
+                    routed_channel = self._client.get_channel(int(routed_thread_id)) if self._client else None
+                    if routed_channel is None and self._client is not None:
+                        routed_channel = await self._client.fetch_channel(int(routed_thread_id))
+                    if routed_channel is not None:
+                        auto_threaded_channel = routed_channel
+                        parent_channel_id = str(target_parent_id)
+                        is_thread = True
+                        thread_id = str(routed_channel.id)
+                        mention_prefix = True
+                        self._threads.mark(thread_id)
+                        source_msg_id = str(getattr(message, "id", "") or "")
+                        user_name = getattr(message.author, "display_name", None) or getattr(message.author, "name", "user")
+                        route_label = str(selected_route.get("label") or "Deep Work")
+                        normalized_content = (
+                            f"[{route_label} handoff from channel {source_channel_id} message {source_msg_id} by {user_name}]\n"
+                            f"{task_text}"
+                        )
+                        message.content = normalized_content
+
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
-            skip_thread = bool(channel_ids & no_thread_channels) or is_free_channel
+            free_response_auto_thread_channels = self._discord_free_response_auto_thread_channels()
+            free_channel_threads_enabled = bool(channel_ids & free_response_auto_thread_channels)
+            skip_thread = bool(channel_ids & no_thread_channels) or (is_free_channel and not free_channel_threads_enabled)
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
@@ -6370,8 +6537,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     ``DISCORD_REQUIRE_MENTION``, ``DISCORD_FREE_RESPONSE_CHANNELS``,
     ``DISCORD_AUTO_THREAD``, ``DISCORD_REACTIONS``,
     ``DISCORD_IGNORED_CHANNELS``, ``DISCORD_ALLOWED_CHANNELS``,
-    ``DISCORD_NO_THREAD_CHANNELS``, ``DISCORD_HISTORY_BACKFILL``,
-    ``DISCORD_HISTORY_BACKFILL_LIMIT``, ``DISCORD_ALLOW_MENTION_*``,
+    ``DISCORD_NO_THREAD_CHANNELS``, ``DISCORD_FREE_RESPONSE_AUTO_THREAD_CHANNELS``,
+    ``DISCORD_HISTORY_BACKFILL``, ``DISCORD_HISTORY_BACKFILL_LIMIT``, ``DISCORD_ALLOW_MENTION_*``,
     ``DISCORD_REPLY_TO_MODE``, ``DISCORD_THREAD_REQUIRE_MENTION``).
     Rather than rewrite ~50 call sites inside the adapter to read from
     ``PlatformConfig.extra`` instead, this hook keeps the existing
@@ -6430,6 +6597,11 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         if isinstance(ntc, list):
             ntc = ",".join(str(v) for v in ntc)
         os.environ["DISCORD_NO_THREAD_CHANNELS"] = str(ntc)
+    fratc = discord_cfg.get("free_response_auto_thread_channels")
+    if fratc is not None and not os.getenv("DISCORD_FREE_RESPONSE_AUTO_THREAD_CHANNELS"):
+        if isinstance(fratc, list):
+            fratc = ",".join(str(v) for v in fratc)
+        os.environ["DISCORD_FREE_RESPONSE_AUTO_THREAD_CHANNELS"] = str(fratc)
     # history_backfill: recover missed channel messages for shared sessions
     # when require_mention is active.  Fetches messages between bot turns
     # and prepends them to the user message for context.
