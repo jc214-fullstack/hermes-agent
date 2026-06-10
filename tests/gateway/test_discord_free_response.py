@@ -86,6 +86,11 @@ class FakeThread:
         self.parent_id = getattr(parent, "id", None)
         self.guild = getattr(parent, "guild", None) or SimpleNamespace(name=guild_name)
         self.topic = None
+        self.sent_messages = []
+
+    async def send(self, content):
+        self.sent_messages.append(content)
+        return SimpleNamespace(id=9999, content=content)
 
     def history(self, *, limit, before, after=None, oldest_first=None):
         async def _iter():
@@ -804,6 +809,65 @@ async def test_discord_generic_handoff_route_uses_configured_marker_and_label(ad
     assert event.source.parent_chat_id == "555"
     assert event.text.startswith("[Research handoff from channel 321 message 123 by Jezza]")
     assert event.text.endswith("summarize the repo")
+
+
+@pytest.mark.asyncio
+async def test_discord_handoff_route_rejects_unauthorized_origin(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    adapter.config.extra["handoff_routes"] = [
+        {
+            "name": "queued-kanban",
+            "label": "Queued Kanban",
+            "target_channel_id": "555",
+            "trigger_phrases": ["push this to queued kanban"],
+            "thread": {"name_prefix": "Queued Kanban"},
+            "run": {"mode": "post_only"},
+            "permissions": {"allowed_origin_chat_ids": ["777"]},
+        }
+    ]
+    adapter.create_handoff_thread = AsyncMock()
+
+    message = make_message(channel=FakeTextChannel(channel_id=321), content="push this to queued kanban: ship it")
+    await adapter._handle_message(message)
+
+    adapter.create_handoff_thread.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_handoff_route_allows_parent_origin_and_post_only(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    adapter.config.extra["handoff_routes"] = [
+        {
+            "name": "queued-kanban",
+            "label": "Queued Kanban",
+            "target_channel_id": "555",
+            "trigger_phrases": ["push this to queued kanban"],
+            "thread": {"name_prefix": "Queued Kanban"},
+            "run": {"mode": "post_only"},
+            "permissions": {"allowed_origin_chat_ids": ["777"]},
+        }
+    ]
+    adapter.create_handoff_thread = AsyncMock(return_value="2002")
+    queued_parent = FakeTextChannel(channel_id=555, name="queued-kanbans")
+    routed_thread = FakeThread(channel_id=2002, name="Queued Kanban — task", parent=queued_parent)
+    adapter._client.get_channel = MagicMock(return_value=routed_thread)
+    adapter._client.fetch_channel = AsyncMock(return_value=routed_thread)
+
+    source_parent = FakeTextChannel(channel_id=777, name="media-analysis")
+    message = make_message(
+        channel=FakeThread(channel_id=321, name="analysis thread", parent=source_parent),
+        content="push this to queued kanban: ship it",
+    )
+    await adapter._handle_message(message)
+
+    adapter.create_handoff_thread.assert_awaited_once_with("555", "Queued Kanban — ship it")
+    adapter.handle_message.assert_not_awaited()
+    assert routed_thread.sent_messages == [
+        "[Queued Kanban handoff from channel 321 message 123 by Jezza]\nship it"
+    ]
 
 
 @pytest.mark.asyncio

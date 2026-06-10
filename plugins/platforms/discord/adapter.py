@@ -4029,10 +4029,89 @@ class DiscordAdapter(BasePlatformAdapter):
     def _discord_handoff_auto_run_markers(self) -> set[str]:
         markers = {"[AUTO_RUN_DEEP_WORK]"}
         for route in self._discord_handoff_routes():
-            marker = str(route.get("auto_run_marker") or "").strip()
+            marker = self._handoff_route_auto_run_marker(route)
             if marker:
                 markers.add(marker)
         return markers
+
+    @staticmethod
+    def _handoff_route_nested(route: dict[str, Any], key: str) -> dict[str, Any]:
+        value = route.get(key)
+        return value if isinstance(value, dict) else {}
+
+    def _handoff_route_label(self, route: dict[str, Any]) -> str:
+        return str(route.get("label") or route.get("name") or "Handoff").strip() or "Handoff"
+
+    def _handoff_route_thread_name_prefix(self, route: dict[str, Any]) -> str:
+        thread = self._handoff_route_nested(route, "thread")
+        return str(
+            route.get("thread_name_prefix")
+            or thread.get("name_prefix")
+            or self._handoff_route_label(route)
+        ).strip() or "Handoff"
+
+    def _handoff_route_run_mode(self, route: dict[str, Any]) -> str:
+        run = self._handoff_route_nested(route, "run")
+        mode = str(route.get("run_mode") or run.get("mode") or "auto").strip().lower()
+        return mode if mode in {"auto", "post_only"} else "auto"
+
+    def _handoff_route_auto_run_marker(self, route: dict[str, Any]) -> str:
+        run = self._handoff_route_nested(route, "run")
+        return str(route.get("auto_run_marker") or run.get("auto_run_marker") or "").strip()
+
+    @staticmethod
+    def _handoff_route_allowed_origin_chat_ids(route: dict[str, Any]) -> set[str]:
+        permissions_raw = route.get("permissions")
+        permissions = permissions_raw if isinstance(permissions_raw, dict) else {}
+        raw = (
+            route.get("allowed_origin_chat_ids")
+            or route.get("allowed_source_chat_ids")
+            or permissions.get("allowed_origin_chat_ids")
+            or permissions.get("allowed_source_chat_ids")
+            or []
+        )
+        if isinstance(raw, str):
+            candidates = raw.split(",")
+        elif isinstance(raw, (list, tuple, set)):
+            candidates = raw
+        else:
+            candidates = []
+        return {str(item).strip() for item in candidates if str(item).strip()}
+
+    def _handoff_route_origin_allowed(
+        self,
+        route: dict[str, Any],
+        *,
+        source_channel_id: str,
+        parent_channel_id: str | None,
+    ) -> bool:
+        allowed = self._handoff_route_allowed_origin_chat_ids(route)
+        if not allowed:
+            return True
+        candidates = {str(source_channel_id or "").strip(), str(parent_channel_id or "").strip()}
+        candidates.discard("")
+        return bool(candidates & allowed)
+
+    async def _post_handoff_packet_only(
+        self,
+        channel: Any,
+        *,
+        route: dict[str, Any],
+        source_channel_id: str,
+        source_message_id: str,
+        user_name: str,
+        task_text: str,
+    ) -> None:
+        label = self._handoff_route_label(route)
+        packet = (
+            f"[{label} handoff from channel {source_channel_id} message {source_message_id} by {user_name}]\n"
+            f"{task_text}"
+        )
+        send = getattr(channel, "send", None)
+        if send is None:
+            logger.warning("[%s] Handoff route %s is post_only but destination has no send()", self.name, label)
+            return
+        await send(packet)
 
     @staticmethod
     def _normalize_handoff_trigger_phrases(raw_phrases: Any) -> list[str]:
@@ -4860,7 +4939,7 @@ class DiscordAdapter(BasePlatformAdapter):
         selected_route = None
         auto_run_marker = None
         for route in self._discord_handoff_routes():
-            marker = str(route.get("auto_run_marker") or "").strip()
+            marker = self._handoff_route_auto_run_marker(route)
             if marker and marker in normalized_content:
                 selected_route = route
                 auto_run_marker = marker
@@ -4880,6 +4959,19 @@ class DiscordAdapter(BasePlatformAdapter):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
                 channel_ids.add(parent_channel_id)
+
+            if selected_route and not self._handoff_route_origin_allowed(
+                selected_route,
+                source_channel_id=str(getattr(message.channel, "id", "") or ""),
+                parent_channel_id=parent_channel_id,
+            ):
+                logger.info(
+                    "[%s] Ignoring handoff route %s from unauthorized origin channel ids: %s",
+                    self.name,
+                    self._handoff_route_label(selected_route),
+                    sorted(channel_ids),
+                )
+                return
 
             # Check allowed channels - if set, only respond in these channels
             allowed_channels_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "")
@@ -4941,7 +5033,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     task_text = self._strip_deep_work_trigger(normalized_content, auto_run_marker)
                 if not task_text:
                     task_text = "Continue this task in Deep Work. Ask one clarification question if needed and proceed."
-                thread_name_prefix = str(selected_route.get("thread_name_prefix") or selected_route.get("label") or "Deep Work").strip() or "Deep Work"
+                thread_name_prefix = self._handoff_route_thread_name_prefix(selected_route)
                 thread_name = f"{thread_name_prefix} — {task_text[:56].strip() or 'handoff'}"[:80]
                 routed_thread_id = await self.create_handoff_thread(target_parent_id, thread_name)
                 if routed_thread_id:
@@ -4957,7 +5049,17 @@ class DiscordAdapter(BasePlatformAdapter):
                         self._threads.mark(thread_id)
                         source_msg_id = str(getattr(message, "id", "") or "")
                         user_name = getattr(message.author, "display_name", None) or getattr(message.author, "name", "user")
-                        route_label = str(selected_route.get("label") or "Deep Work")
+                        route_label = self._handoff_route_label(selected_route)
+                        if self._handoff_route_run_mode(selected_route) == "post_only":
+                            await self._post_handoff_packet_only(
+                                routed_channel,
+                                route=selected_route,
+                                source_channel_id=source_channel_id,
+                                source_message_id=source_msg_id,
+                                user_name=user_name,
+                                task_text=task_text,
+                            )
+                            return
                         normalized_content = (
                             f"[{route_label} handoff from channel {source_channel_id} message {source_msg_id} by {user_name}]\n"
                             f"{task_text}"
