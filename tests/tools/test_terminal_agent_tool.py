@@ -1,5 +1,6 @@
 import json
 
+from model_tools import handle_function_call
 from tools.terminal_agent_tool import _build_runtime_command, _infer_runtime, _run_terminal_agent
 
 
@@ -43,7 +44,7 @@ def test_build_runtime_command_shapes():
         "--max-turns",
         "5",
     ]
-    assert _build_runtime_command("codex", "Say hi", 5) == ["codex", "exec", "--full-auto", "Say hi"]
+    assert _build_runtime_command("codex", "Say hi", 5) == ["codex", "exec", "--sandbox", "workspace-write", "Say hi"]
 
 
 def test_dry_run_returns_launch_plan(monkeypatch, tmp_path):
@@ -124,8 +125,42 @@ def test_live_run_executes_codex_and_sets_launch_env(monkeypatch, tmp_path):
     assert payload["exit_code"] == 0
     assert payload["stdout"] == "done"
     assert payload["launch"]["env"]["HOME"] == "/home/dylan-malik"
-    assert recorded["command"] == ["codex", "exec", "--full-auto", "Use Codex to update tests"]
+    assert recorded["command"] == ["codex", "exec", "--sandbox", "workspace-write", "Use Codex to update tests"]
     assert recorded["cwd"] == str(tmp_path)
     assert recorded["env"]["HOME"] == "/home/dylan-malik"
     assert recorded["env"]["EXTRA"] == "1"
     assert recorded["env"]["CODEX_HOME"] == str(runtime_home)
+
+
+def test_handle_function_call_terminal_agent_tolerates_task_id(monkeypatch, tmp_path):
+    runtime_home = tmp_path / ".claude"
+    runtime_home.mkdir()
+
+    monkeypatch.setattr("tools.terminal_agent_tool._find_runtime_binary", lambda _name: "/usr/bin/claude")
+    monkeypatch.setattr("tools.terminal_agent_tool._repo_root", lambda _args: tmp_path)
+    monkeypatch.setattr("tools.terminal_agent_tool._runtime_home", lambda runtime, home=None: runtime_home)
+    monkeypatch.setattr("tools.terminal_agent_tool._claude_home_override_allowed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "tools.terminal_agent_tool._apply_loadout",
+        lambda *args, **kwargs: {
+            "manifest_path": str(runtime_home / "hermes-loadout.json"),
+            "manifest": {
+                "loadout": "deep-coding",
+                "runtime": "claude",
+                "launch": {"env": {"HOME": "/home/dylan-malik"}},
+            },
+            "launch_notice": "CLAUDE CODE | loadout: deep-coding | session: fresh | cwd: testdir",
+        },
+    )
+
+    result = json.loads(
+        handle_function_call(
+            "terminal_agent",
+            {"task": "Use Claude Code to analyze this", "dry_run": True},
+            task_id="task-123",
+        )
+    )
+
+    assert result["success"] is True
+    assert result["runtime"] == "claude"
+    assert result["applied_loadout"] == "deep-coding"

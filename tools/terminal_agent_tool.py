@@ -57,7 +57,7 @@ def _build_runtime_command(runtime: str, task: str, max_turns: int) -> list[str]
     if runtime == "claude":
         return ["claude", "-p", task, "--output-format", "json", "--max-turns", str(max_turns)]
     if runtime == "codex":
-        return ["codex", "exec", "--full-auto", task]
+        return ["codex", "exec", "--sandbox", "workspace-write", task]
     raise ValueError(f"Unsupported runtime: {runtime}")
 
 
@@ -233,7 +233,16 @@ registry.register(
     name="terminal_agent",
     toolset="terminal",
     schema=TERMINAL_AGENT_SCHEMA,
-    handler=_run_terminal_agent,
+    handler=lambda args, **_kw: _run_terminal_agent(
+        task=args.get("task", ""),
+        runtime=args.get("runtime"),
+        cwd=args.get("cwd"),
+        explicit_loadout=args.get("explicit_loadout"),
+        repo=args.get("repo"),
+        home=args.get("home"),
+        max_turns=args.get("max_turns", 8),
+        dry_run=args.get("dry_run", False),
+    ),
     check_fn=check_terminal_agent_requirements,
     requires_env=[],
     is_async=False,
