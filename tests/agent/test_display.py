@@ -104,6 +104,20 @@ class TestBuildToolPreview:
         assert result is not None
         assert "find something" in result
 
+    def test_terminal_agent_preview_shows_runtime_and_loadout(self):
+        result = build_tool_preview(
+            "terminal_agent",
+            {"runtime": "claude", "explicit_loadout": "deep-coding", "task": "Use Claude Code to inspect auth"},
+        )
+        assert result == "Claude Code · loadout deep-coding"
+
+    def test_terminal_agent_preview_infers_runtime_and_auto_loadout(self):
+        result = build_tool_preview(
+            "terminal_agent",
+            {"task": "Use Claude Code to inspect auth"},
+        )
+        assert result == "Claude Code · loadout auto"
+
     def test_false_like_args_zero(self):
         """Non-dict falsy values should return None, not crash."""
         assert build_tool_preview("terminal", 0) is None
@@ -169,6 +183,22 @@ class TestCuteToolMessagePreviewLength:
         line = get_cute_tool_message("patch", {"path": "/tmp/a.py"}, 0.1, result=result)
 
         assert "[error]" not in line
+
+    def test_terminal_agent_cute_message_uses_applied_loadout_from_result(self):
+        result = json.dumps({
+            "success": True,
+            "runtime": "claude",
+            "applied_loadout": "deep-coding",
+        })
+
+        line = get_cute_tool_message(
+            "terminal_agent",
+            {"task": "Use Claude Code to inspect auth"},
+            0.1,
+            result=result,
+        )
+
+        assert "Claude Code · loadout deep-coding" in line
 
 
 class TestEditDiffPreview:

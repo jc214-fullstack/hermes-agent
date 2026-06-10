@@ -168,6 +168,55 @@ def _oneline(text: str) -> str:
     return " ".join(text.split())
 
 
+def _terminal_agent_runtime_label(args: dict | None, result: str | None = None) -> str:
+    """Return a human-friendly runtime label for ``terminal_agent``."""
+    payload = safe_json_loads(result) if result else None
+    if isinstance(payload, dict):
+        runtime = str(payload.get("runtime") or "").strip().lower()
+        if runtime == "claude":
+            return "Claude Code"
+        if runtime == "codex":
+            return "Codex"
+
+    if not isinstance(args, dict):
+        return "agent"
+
+    runtime = str(args.get("runtime") or "").strip().lower()
+    if runtime == "claude":
+        return "Claude Code"
+    if runtime == "codex":
+        return "Codex"
+
+    task = str(args.get("task") or "")
+    task_lower = task.lower()
+    if "claude code" in task_lower or "claude" in task_lower:
+        return "Claude Code"
+    if "codex" in task_lower:
+        return "Codex"
+    return "agent"
+
+
+def _terminal_agent_loadout_label(args: dict | None, result: str | None = None) -> str:
+    """Return the applied/requested loadout label for ``terminal_agent``."""
+    payload = safe_json_loads(result) if result else None
+    if isinstance(payload, dict):
+        applied = str(payload.get("applied_loadout") or "").strip()
+        if applied:
+            return applied
+
+    if not isinstance(args, dict):
+        return "auto"
+    explicit = str(args.get("explicit_loadout") or "").strip()
+    return explicit or "auto"
+
+
+def _terminal_agent_preview(args: dict | None, result: str | None = None) -> str:
+    """Build the dedicated preview string for ``terminal_agent``."""
+    runtime_label = _terminal_agent_runtime_label(args, result)
+    loadout_label = _terminal_agent_loadout_label(args, result)
+    return f"{runtime_label} · loadout {loadout_label}"
+
+
 def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -> str | None:
     """Build a short preview of a tool call's primary argument for display.
 
@@ -239,6 +288,12 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         if len(msg) > 20:
             msg = msg[:17] + "..."
         return f"to {target}: \"{msg}\""
+
+    if tool_name == "terminal_agent":
+        preview = _terminal_agent_preview(args)
+        if max_len > 0 and len(preview) > max_len:
+            return preview[:max_len - 3] + "..."
+        return preview
 
     key = primary_args.get(tool_name)
     if not key:
@@ -1021,6 +1076,8 @@ def get_cute_tool_message(
         if tasks and isinstance(tasks, list):
             return _wrap(f"┊ 🔀 delegate  {len(tasks)} parallel tasks  {dur}")
         return _wrap(f"┊ 🔀 delegate  {_trunc(args.get('goal', ''), 35)}  {dur}")
+    if tool_name == "terminal_agent":
+        return _wrap(f"┊ 🧠 agent     {_trunc(_terminal_agent_preview(args, result), 35)}  {dur}")
 
     preview = build_tool_preview(tool_name, args) or ""
     return _wrap(f"┊ ⚡ {tool_name[:9]:9} {_trunc(preview, 35)}  {dur}")
