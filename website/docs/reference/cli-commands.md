@@ -350,6 +350,8 @@ Operational notes:
 - `launch claude` currently supports only the default live home (`~/.claude`). Codex can use `--home` overrides.
 - For pre-restart prep, run `apply --target-home` first so the runtime homes and `hermes-loadout.json` manifests are already in place when the gateway comes back up.
 - After shipping loadout-related Hermes changes, restart the gateway with `hermes gateway restart`, then re-run `hermes loadout status --json` and one `launch ... --dry-run --json` command as the smoke test.
+- For repo-owned verification of the in-chat metadata path, run `python scripts/verify_terminal_agent_loadouts.py` (add `--live` for real Claude/Codex one-shots). This checks the `terminal_agent` dispatch path plus the rendered runtime/loadout preview text.
+- Use raw `terminal` launches when you want full shell/TUI output. Use `terminal_agent` when you want Hermes-managed loadout application plus the chat-status labels such as `Claude Code · loadout deep-coding`.
 
 ## `hermes whatsapp`
 

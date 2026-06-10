@@ -170,7 +170,7 @@ Registered when the agent is either (a) spawned by the kanban dispatcher (`HERME
 |------|-------------|----------------------|
 | `process` | Manage background processes started with terminal(background=true). Actions: 'list' (show all), 'poll' (check status + new output), 'log' (full output with pagination), 'wait' (block until done or timeout), 'kill' (terminate), 'write' (sen… | — |
 | `terminal` | Execute shell commands on a Linux environment. Filesystem persists between calls. Set `background=true` for long-running servers. Set `notify_on_complete=true` (with `background=true`) to get an automatic notification when the process finishes — no polling needed. Do NOT use cat/head/tail — use read_file. Do NOT use grep/rg/find — use search_files. | — |
-| `terminal_agent` | Launch a one-shot Claude Code or Codex task through the Hermes loadout system. Hermes resolves the loadout, materializes the runtime surface into the correct home, runs the task, and returns structured output (or a dry-run launch plan). | — |
+| `terminal_agent` | Launch a one-shot Claude Code or Codex task through the Hermes loadout system. Hermes resolves the loadout, materializes the runtime surface into the correct home, runs the task, and returns structured output (or a dry-run launch plan). This is the path that powers Hermes runtime/loadout status labels; raw `terminal` commands do not emit that metadata. | — |
 
 ## `todo` toolset
 

@@ -164,3 +164,43 @@ def test_handle_function_call_terminal_agent_tolerates_task_id(monkeypatch, tmp_
     assert result["success"] is True
     assert result["runtime"] == "claude"
     assert result["applied_loadout"] == "deep-coding"
+
+
+def test_handle_function_call_terminal_agent_preserves_launch_notice_for_codex(monkeypatch, tmp_path):
+    runtime_home = tmp_path / ".codex"
+    runtime_home.mkdir()
+
+    monkeypatch.setattr("tools.terminal_agent_tool._find_runtime_binary", lambda _name: "/usr/bin/codex")
+    monkeypatch.setattr("tools.terminal_agent_tool._repo_root", lambda _args: tmp_path)
+    monkeypatch.setattr("tools.terminal_agent_tool._runtime_home", lambda runtime, home=None: runtime_home)
+    monkeypatch.setattr("tools.terminal_agent_tool._claude_home_override_allowed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "tools.terminal_agent_tool._apply_loadout",
+        lambda *args, **kwargs: {
+            "manifest_path": str(runtime_home / "hermes-loadout.json"),
+            "manifest": {
+                "loadout": "research",
+                "runtime": "codex",
+                "launch": {"env": {"HOME": "/home/dylan-malik"}},
+            },
+            "launch_notice": "CODEX | loadout: research | session: fresh | cwd: testdir",
+        },
+    )
+
+    result = json.loads(
+        handle_function_call(
+            "terminal_agent",
+            {
+                "task": "Use Codex to analyze this",
+                "runtime": "codex",
+                "explicit_loadout": "research",
+                "dry_run": True,
+            },
+            task_id="task-456",
+        )
+    )
+
+    assert result["success"] is True
+    assert result["runtime"] == "codex"
+    assert result["applied_loadout"] == "research"
+    assert result["launch_notice"] == "CODEX | loadout: research | session: fresh | cwd: testdir"

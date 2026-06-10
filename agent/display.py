@@ -6,6 +6,7 @@ Used by AIAgent._execute_tool_calls for CLI feedback.
 
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -178,6 +179,12 @@ def _terminal_agent_runtime_label(args: dict | None, result: str | None = None) 
         if runtime == "codex":
             return "Codex"
 
+        launch_notice = str(payload.get("launch_notice") or "").strip().lower()
+        if launch_notice.startswith("claude code"):
+            return "Claude Code"
+        if launch_notice.startswith("codex"):
+            return "Codex"
+
     if not isinstance(args, dict):
         return "agent"
 
@@ -203,6 +210,13 @@ def _terminal_agent_loadout_label(args: dict | None, result: str | None = None) 
         applied = str(payload.get("applied_loadout") or "").strip()
         if applied:
             return applied
+
+        launch_notice = str(payload.get("launch_notice") or "").strip()
+        match = re.search(r"\bloadout:\s*([^|]+)", launch_notice, re.IGNORECASE)
+        if match:
+            parsed = match.group(1).strip()
+            if parsed:
+                return parsed
 
     if not isinstance(args, dict):
         return "auto"

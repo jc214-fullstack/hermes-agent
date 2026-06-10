@@ -200,6 +200,21 @@ class TestCuteToolMessagePreviewLength:
 
         assert "Claude Code · loadout deep-coding" in line
 
+    def test_terminal_agent_cute_message_falls_back_to_launch_notice_metadata(self):
+        result = json.dumps({
+            "success": True,
+            "launch_notice": "CODEX | loadout: research | session: fresh | cwd: repo",
+        })
+
+        line = get_cute_tool_message(
+            "terminal_agent",
+            {},
+            0.1,
+            result=result,
+        )
+
+        assert "Codex · loadout research" in line
+
 
 class TestEditDiffPreview:
     def test_extract_edit_diff_for_patch(self):
