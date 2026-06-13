@@ -9042,6 +9042,9 @@ class GatewayRunner:
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
                 "chat_id": source.chat_id or "",
+                "parent_chat_id": getattr(source, "parent_chat_id", None) or "",
+                "thread_id": getattr(source, "thread_id", None) or "",
+                "message_id": event.message_id or getattr(source, "message_id", None) or "",
                 "session_id": session_entry.session_id,
                 "message": message_text[:500],
             }
