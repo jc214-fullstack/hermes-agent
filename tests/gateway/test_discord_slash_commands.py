@@ -430,8 +430,11 @@ async def test_handle_thread_create_slash_reports_failure(adapter):
 async def test_dispatch_thread_session_builds_thread_event(adapter):
     """Dispatched event should have chat_type=thread and chat_id=thread_id."""
     interaction = SimpleNamespace(
+        id=777,
         user=SimpleNamespace(display_name="Jezza", id=42),
-        guild=SimpleNamespace(name="TestGuild"),
+        guild=SimpleNamespace(name="TestGuild", id=1),
+        guild_id=1,
+        channel=_FakeTextChannel(channel_id=100, name="deep-work"),
     )
 
     captured_events = []
@@ -449,6 +452,9 @@ async def test_dispatch_thread_session_builds_thread_event(adapter):
     assert event.source.chat_id == "555"
     assert event.source.chat_type == "thread"
     assert event.source.thread_id == "555"
+    assert event.source.parent_chat_id == "100"
+    assert event.source.guild_id == "1"
+    assert event.source.message_id == "777"
     assert "TestGuild" in event.source.chat_name
 
 
@@ -459,8 +465,10 @@ async def test_dispatch_thread_session_builds_thread_event(adapter):
 
 def test_build_slash_event_preserves_thread_context(adapter):
     interaction = SimpleNamespace(
+        id=888,
         channel=_FakeThreadChannel(channel_id=555, name="Planning"),
         channel_id=555,
+        guild_id=1,
         user=SimpleNamespace(display_name="Jezza", id=42),
     )
 
@@ -470,6 +478,9 @@ def test_build_slash_event_preserves_thread_context(adapter):
     assert event.source.chat_id == "555"
     assert event.source.chat_type == "thread"
     assert event.source.thread_id == "555"
+    assert event.source.parent_chat_id == "100"
+    assert event.source.guild_id == "1"
+    assert event.source.message_id == "888"
     assert "TestGuild" in event.source.chat_name
 
 
