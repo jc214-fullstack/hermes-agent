@@ -12222,6 +12222,13 @@ def main():
     webhook_parser.set_defaults(func=cmd_webhook)
 
     # =========================================================================
+    # loadout command — external Claude/Codex runtime loadout control
+    # =========================================================================
+    from hermes_cli.loadout_cli import add_parser as _add_loadout_parser
+
+    _add_loadout_parser(subparsers)
+
+    # =========================================================================
     # portal command — Nous Portal status + Tool Gateway routing
     # =========================================================================
     from hermes_cli.portal_cli import add_parser as _add_portal_parser
